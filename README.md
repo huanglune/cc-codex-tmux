@@ -2,6 +2,8 @@
 
 A [Claude Code](https://docs.anthropic.com/en/docs/claude-code) skill that dispatches tasks to [OpenAI Codex CLI](https://github.com/openai/codex) inside tmux panes — giving you a visible, interactive TUI while Claude Code's main session stays unblocked.
 
+![Two Codex tasks running in parallel tmux panes alongside Claude Code](screenshot.png)
+
 ## Why
 
 Claude Code can delegate sub-tasks to Codex CLI. Without this skill, delegation means either:
