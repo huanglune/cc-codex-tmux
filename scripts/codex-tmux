@@ -1,0 +1,323 @@
+#!/usr/bin/env bash
+# codex-tmux — 在 tmux 窗格里跑「交互式 codex TUI」执行任务,主会话仍走后台退出唤醒。
+#
+# 派发(Bash run_in_background 调用):
+#   codex-tmux -t <标题> -o <终报路径> -C <工作目录> --brief <简报文件> \
+#       [-- <额外 codex 旗标,如 -c 'model_reasoning_effort="max"'>]
+#   codex-tmux --resume <session-id|last> -t ... -o ... --brief <追问文件> [-- ...]
+# 窗格管理(镜像 claude agent-team TmuxBackend 的登记/清理逻辑):
+#   codex-tmux list                              列出登记窗格(状态/位置/终报)
+#   codex-tmux kill <任务名|%pane_id|done|all>   定向/批量关闭并注销
+#
+# 选项:
+#   -t TITLE      窗格标题(默认取 -o 文件名)
+#   -o REPORT     最终回复落盘路径(必填;辅助文件 REPORT.notify.json/.pane.log 等同目录)
+#   -C DIR        codex 工作目录(默认当前目录)
+#   --brief FILE  任务简报文件;缺省从 stdin 读(兼容 `< 简报` 习惯)
+#   --resume ID   续聊:codex resume <ID>;ID=last → --last
+#   -w            用独立 tmux window(名 cx:<标题>)代替分割 pane
+#   --close       完成后关闭窗格(默认保留,可继续在窗格里与 codex 对话)
+#   --timeout S   等待上限秒(默认 0=不限);超时退出 124,codex 本体继续跑
+#
+# 机制:
+#   * 窗格里是真 codex TUI,进度可视、可插手;布局仿 agent-team(同比):主窗格居左,
+#     首个 cx 窗格 -h 切 CODEX_TMUX_PANE_WIDTH(默认 70%,cx 侧占大头),后续取 cx 区
+#     中位窗格按奇偶交替 -v/-h 再切,>2 窗格时 main-vertical + 主窗格收
+#     CODEX_TMUX_MAIN_WIDTH(默认 30%);
+#   * 每窗格独立边框色(agent-team setPaneBorderColor/setPaneTitle 同款);标题钉死:
+#     pane 级 allow-set-title off,codex 的 OSC 改名失效,边框恒显 cx:<标题>,完成变 ✅;
+#   * 登记簿:${XDG_CACHE_HOME:-~/.cache}/codex-tmux/registry.tsv 记
+#     pane_id/标题/终报/工作目录/启动时间/边框色;list/kill 先按 live pane 对账清死条目;
+#   * 完成检测走 codex 官方 notify 接口:-c 'notify=["<脚本>"]',agent-turn-complete
+#     回调取 last-assistant-message 写入 -o,本进程退出 → 唤醒主会话;
+#   * 终报尾部附 session-id 与 resume 提示(从 $CODEX_HOME/sessions 新增 rollout 反查);
+#   * 不在 tmux → 自动降级 codex exec 黑盒模式(自动补 --skip-git-repo-check,-o 语义不变);
+#   * 窗格死亡且未完成 → 退出 2(现场保留在死窗格 + REPORT.pane.log);
+#   * 工作目录自动预信任(-c projects."<dir>".trust_level="trusted"),新目录不弹信任提示。
+#   依赖:bash≥4.4、tmux≥3.2、codex CLI、GNU coreutils;jq/node/python3 任一(提取终报,
+#        全缺时终报只留原始 JSON 指针,不影响流程)。
+#   环境变量:CODEX_TMUX_MODE=pane|window|exec、CODEX_TMUX_PANE_WIDTH(默认 70%)、
+#            CODEX_TMUX_MAIN_WIDTH(默认 30%)、CODEX_TMUX_LAYOUT=main-vertical|none、
+#            CODEX_TMUX_BYPASS=1|0(默认 1=--dangerously-bypass-approvals-and-sandbox;
+#              0=codex 默认审批/沙箱,审批弹窗直接在窗格里人工处理)、
+#            CODEX_HOME(session 反查目录,默认 ~/.codex)
+
+set -u
+
+# ============ 登记簿与窗格管理(镜像 agent-team TmuxBackend) ============
+REG_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/codex-tmux"
+REG="$REG_DIR/registry.tsv"   # pane_id \t 标题 \t 终报 \t 工作目录 \t 启动时间 \t 边框色
+CX_COLORS=(colour45 colour208 colour118 colour171 colour214 colour87 colour203 colour155)
+
+reg_prune() {   # 按现存 pane 对账,清掉死条目
+    [ -s "$REG" ] || return 0
+    local live tmp; live=$(tmux list-panes -a -F '#{pane_id}' 2>/dev/null) || live=""
+    tmp="$REG.tmp.$$"
+    awk -F'\t' -v live="$live" \
+        'BEGIN{n=split(live,a,"\n");for(i=1;i<=n;i++)L[a[i]]=1} ($1 in L)' \
+        "$REG" > "$tmp" 2>/dev/null || : > "$tmp"
+    mv -f "$tmp" "$REG"
+}
+
+rebalance() {   # agent-team 同款:>2 窗格时 main-vertical + 主窗格定宽
+    local win="$1" panes n
+    [ "${CODEX_TMUX_LAYOUT:-main-vertical}" = none ] && return 0
+    panes=$(tmux list-panes -t "$win" -F '#{pane_id}' 2>/dev/null) || return 0
+    n=$(grep -c . <<<"$panes")
+    [ "$n" -gt 2 ] || return 0
+    tmux select-layout -t "$win" main-vertical 2>/dev/null || true
+    tmux resize-pane -t "$(head -n1 <<<"$panes")" -x "${CODEX_TMUX_MAIN_WIDTH:-30%}" 2>/dev/null || true
+}
+
+cmd_list() {
+    reg_prune
+    [ -s "$REG" ] || { echo "(无登记的 codex 窗格)"; return 0; }
+    local pid t rep wd ts color st loc
+    {
+        printf 'PANE\t任务\t状态\t位置\t启动\t终报\n'
+        while IFS=$'\t' read -r pid t rep wd ts color; do
+            st=运行中; [ -e "$rep.done" ] && st=完成
+            [ "$(tmux display-message -p -t "$pid" '#{pane_dead}' 2>/dev/null)" = 1 ] && st=死亡
+            loc=$(tmux display-message -p -t "$pid" '#{session_name}:#{window_index}.#{pane_index}' 2>/dev/null) || loc='?'
+            printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$pid" "$t" "$st" "$loc" "$ts" "$rep"
+        done < "$REG"
+    } | { column -t -s "$(printf '\t')" 2>/dev/null || cat; }
+}
+
+cmd_kill() {
+    local sel="${1:-}"
+    [ -n "$sel" ] || { echo "用法: codex-tmux kill <任务名|%pane_id|done|all>" >&2; return 2; }
+    sel="${sel#cx:}"
+    reg_prune
+    [ -s "$REG" ] || { echo "(无登记的 codex 窗格)"; return 1; }
+    local pid t rep wd ts color win="" n=0 h
+    local -a hits=()
+    while IFS=$'\t' read -r pid t rep wd ts color; do
+        case "$sel" in
+            all)  hits+=("$pid $t") ;;
+            done) [ -e "$rep.done" ] && hits+=("$pid $t") ;;
+            *)    if [ "$sel" = "$pid" ] || [ "$sel" = "$t" ]; then hits+=("$pid $t"); fi ;;
+        esac
+    done < "$REG"
+    ((${#hits[@]})) || { echo "codex-tmux: 没有匹配 '$sel' 的窗格(codex-tmux list 查看)" >&2; return 1; }
+    if [ "$sel" != all ] && [ "$sel" != done ] && [ ${#hits[@]} -gt 1 ]; then
+        echo "codex-tmux: '$sel' 命中多个,请改用 %pane_id:" >&2
+        printf '  %s\n' "${hits[@]}" >&2; return 3
+    fi
+    for h in "${hits[@]}"; do
+        pid="${h%% *}"
+        win=$(tmux display-message -p -t "$pid" '#{session_name}:#{window_index}' 2>/dev/null) || win=""
+        tmux kill-pane -t "$pid" 2>/dev/null && { echo "已关闭 $h"; n=$((n+1)); }
+    done
+    reg_prune
+    [ -n "$win" ] && rebalance "$win"
+    [ "$n" -gt 0 ]
+}
+
+case "${1:-}" in
+    list|ls)       shift; cmd_list "$@"; exit $? ;;
+    kill|close|rm) shift; cmd_kill "$@"; exit $? ;;
+esac
+
+# ============ 派发参数解析 ============
+title="" report="" workdir="$PWD" workdir_set=0 brief="" resume_id="" mode="${CODEX_TMUX_MODE:-pane}"
+close_pane=0 timeout=0
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -t) title="$2"; shift 2 ;;
+        -o) report="$2"; shift 2 ;;
+        -C) workdir="$2"; workdir_set=1; shift 2 ;;
+        --brief) brief="$2"; shift 2 ;;
+        --resume) resume_id="$2"; shift 2 ;;
+        -w|--window) mode=window; shift ;;
+        --close) close_pane=1; shift ;;
+        --timeout) timeout="$2"; shift 2 ;;
+        --) shift; break ;;
+        -h|--help) sed -n '2,44p' "$0"; exit 0 ;;
+        *) echo "codex-tmux: 未知参数 $1(codex 旗标请放 -- 之后)" >&2; exit 2 ;;
+    esac
+done
+extra=("$@")
+[ -n "$report" ] || { echo "codex-tmux: 缺少 -o <终报路径>" >&2; exit 2; }
+
+report=$(realpath -m -- "$report"); mkdir -p "$(dirname "$report")"
+workdir=$(realpath -m -- "$workdir")
+[ -n "$title" ] || { title=$(basename "$report"); title="${title%%.*}"; }
+
+# 简报:--brief 或 stdin
+if [ -n "$brief" ]; then
+    brief=$(realpath -m -- "$brief")
+else
+    brief="$report.brief"; cat > "$brief"
+fi
+[ -s "$brief" ] || { echo "codex-tmux: 简报为空(--brief 文件或 stdin)" >&2; exit 2; }
+
+bypassflag=()
+[ "${CODEX_TMUX_BYPASS:-1}" = 1 ] && bypassflag=(--dangerously-bypass-approvals-and-sandbox)
+
+json="$report.notify.json"; donef="$report.done"
+notify_sh="$report.notify.sh"; launch_sh="$report.launch.sh"
+panelog="$report.pane.log"; stamp="$report.stamp"
+rm -f "$json" "$donef"; touch "$stamp"
+
+# ---------- 找 tmux;找不到则降级 exec ----------
+target=""
+if [ "$mode" != exec ]; then
+    if [ -n "${TMUX:-}" ]; then
+        target="${TMUX_PANE:-}"
+    elif command -v tmux >/dev/null 2>&1; then
+        target=$(tmux list-sessions -F '#{session_attached} #{session_name}' 2>/dev/null \
+                 | awk '$1>=1{print $2":"; exit}')
+        [ -n "$target" ] || mode=exec
+    else
+        mode=exec
+    fi
+fi
+
+if [ "$mode" = exec ]; then   # —— 黑盒降级:行为同原始 codex exec 用法 ——
+    if [ -n "$resume_id" ]; then
+        rargs=(); [ "$resume_id" = last ] && rargs=(--last) || rargs=("$resume_id")
+        codex exec resume "${bypassflag[@]}" --skip-git-repo-check \
+            "${extra[@]}" -o "$report" "${rargs[@]}" - < "$brief" > "$panelog" 2>&1
+    else
+        codex exec "${bypassflag[@]}" --skip-git-repo-check \
+            -C "$workdir" "${extra[@]}" -o "$report" - < "$brief" > "$panelog" 2>&1
+    fi
+    ec=$?; echo "[codex-tmux] exec 降级模式 exit=$ec 终报=$report 日志=$panelog"; exit "$ec"
+fi
+
+# ---------- 生成 notify 回调脚本(codex 官方接口:turn 完成时携 JSON 调用) ----------
+{
+    printf '#!/usr/bin/env bash\n'
+    printf 'printf %%s "$1" > %q && mv -f %q %q\n' "$json.tmp" "$json.tmp" "$json"
+    printf ': > %q\n' "$donef"
+} > "$notify_sh"; chmod +x "$notify_sh"
+
+# ---------- 生成窗格启动脚本:真 codex TUI + 简报作为首条 prompt ----------
+tuiflags=()
+for f in "${extra[@]}"; do [ "$f" = --skip-git-repo-check ] || tuiflags+=("$f"); done
+{
+    printf '#!/usr/bin/env bash\n'
+    printf 'exec codex'
+    [ -n "$resume_id" ] && printf ' resume'
+    ((${#bypassflag[@]})) && printf ' %q' "${bypassflag[@]}"
+    # resume 且未显式 -C:不传,继承原会话 cwd
+    if [ -z "$resume_id" ] || [ "$workdir_set" = 1 ]; then
+        printf ' -C %q' "$workdir"
+        printf ' -c %q' "projects.\"$workdir\".trust_level=\"trusted\""
+    fi
+    ((${#tuiflags[@]})) && printf ' %q' "${tuiflags[@]}"
+    printf ' -c %q' "notify=[\"$notify_sh\"]"
+    [ "$resume_id" = last ] && printf ' --last'
+    printf ' --'
+    [ -n "$resume_id" ] && [ "$resume_id" != last ] && printf ' %q' "$resume_id"
+    printf ' "$(cat %q)"\n' "$brief"
+} > "$launch_sh"; chmod +x "$launch_sh"
+
+# ---------- 开窗格(agent-team 同款:首个 -h 定宽,后续取 cx 区中位窗格奇偶交替切) ----------
+pane_id="" win=""
+panecmd="exec bash $launch_sh"
+if [ "$mode" = pane ]; then
+    win=$(tmux display-message -p ${target:+-t "$target"} '#{session_name}:#{window_index}' 2>/dev/null) || win=""
+    mapfile -t allp < <(tmux list-panes ${win:+-t "$win"} -F '#{pane_id}' 2>/dev/null)
+    if [ ${#allp[@]} -le 1 ]; then
+        pane_id=$(tmux split-window -d ${target:+-t "$target"} -h -l "${CODEX_TMUX_PANE_WIDTH:-70%}" \
+                  -P -F '#{pane_id}' -- "$panecmd" 2>/dev/null) || pane_id=""
+    else
+        tm=("${allp[@]:1}"); c=${#tm[@]}
+        p="${tm[$(( (c - 1) / 2 ))]:-${allp[-1]}}"
+        dir=-h; [ $((c % 2)) = 1 ] && dir=-v
+        pane_id=$(tmux split-window -d -t "$p" "$dir" -P -F '#{pane_id}' -- "$panecmd" 2>/dev/null) || pane_id=""
+    fi
+fi
+if [ -z "$pane_id" ]; then   # 显式 -w,或分屏没空间 → 独立窗口
+    pane_id=$(tmux new-window -d -n "cx:$title" -P -F '#{pane_id}' \
+              ${target:+-t "$target"} -- "$panecmd" 2>/dev/null) || pane_id=""
+fi
+[ -n "$pane_id" ] || { echo "codex-tmux: 开 tmux 窗格失败" >&2; exit 2; }
+
+# 样式 + 登记(agent-team setPaneBorderColor/setPaneTitle/taskRegistry 同款)
+reg_prune; mkdir -p "$REG_DIR"
+ncx=0; [ -s "$REG" ] && ncx=$(grep -c . "$REG")
+color=${CX_COLORS[$(( ncx % ${#CX_COLORS[@]} ))]}
+tmux select-pane -t "$pane_id" -T "cx:$title" 2>/dev/null || true
+tmux set-option -p -t "$pane_id" pane-border-style "fg=$color" 2>/dev/null || true
+tmux set-option -p -t "$pane_id" pane-active-border-style "fg=$color" 2>/dev/null || true
+tmux set-option -p -t "$pane_id" pane-border-format "#[fg=$color,bold] #{pane_title} #[default]" 2>/dev/null || true
+tmux set-option -p -t "$pane_id" allow-set-title off 2>/dev/null || true
+tmux set-option -p -t "$pane_id" remain-on-exit on 2>/dev/null || true
+tmux set-option -w -t "$pane_id" pane-border-status top 2>/dev/null || true
+[ "$mode" = pane ] && [ -n "$win" ] && rebalance "$win"
+printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$pane_id" "$title" "$report" "$workdir" "$(date '+%F %T')" "$color" >> "$REG"
+echo "[codex-tmux] pane=$pane_id title=cx:$title color=$color 启动:$launch_sh"
+
+capture() { tmux capture-pane -p -S - -t "$pane_id" > "$panelog" 2>/dev/null || true; }
+
+# ---------- 等 notify 完成信号 ----------
+start=$SECONDS
+while [ ! -e "$donef" ]; do
+    dead=$(tmux display-message -p -t "$pane_id" '#{pane_dead}' 2>/dev/null) || dead=gone
+    if [ "$dead" = 1 ] || [ "$dead" = gone ]; then
+        sleep 1; [ -e "$donef" ] && break        # 竞态:退出前一刻刚好完成
+        capture
+        echo "codex-tmux: codex 窗格已死亡但任务未完成,现场见 $panelog(死窗格已保留)" >&2
+        exit 2
+    fi
+    if [ "$timeout" -gt 0 ] && [ $((SECONDS - start)) -ge "$timeout" ]; then
+        capture
+        echo "codex-tmux: 等待 ${timeout}s 超时,codex 仍在 pane=$pane_id 里跑;稍后自查 $json" >&2
+        exit 124
+    fi
+    sleep 2
+done
+
+# ---------- 提取终报 + 反查 session-id ----------
+extract_last() {   # jq → node → python3,谁在用谁
+    if command -v jq >/dev/null 2>&1; then
+        jq -r '."last-assistant-message" // ."last_assistant_message" // empty' "$json" 2>/dev/null
+    elif command -v node >/dev/null 2>&1; then
+        node -e 'const j=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"));
+                 process.stdout.write(String(j["last-assistant-message"]??j["last_assistant_message"]??""))' \
+            "$json" 2>/dev/null
+    elif command -v python3 >/dev/null 2>&1; then
+        python3 -c 'import json,sys; j=json.load(open(sys.argv[1]));
+sys.stdout.write(str(j.get("last-assistant-message") or j.get("last_assistant_message") or ""))' \
+            "$json" 2>/dev/null
+    fi
+}
+last=$(extract_last) || last=""
+
+sid="" rollout=""
+sessdir="${CODEX_HOME:-$HOME/.codex}/sessions"
+mapfile -t newf < <(find "$sessdir" -type f -name 'rollout-*.jsonl' -newer "$stamp" 2>/dev/null)
+cand=()
+for f in "${newf[@]}"; do grep -m1 -qF "\"cwd\":\"$workdir\"" "$f" 2>/dev/null && cand+=("$f"); done
+((${#cand[@]})) || cand=("${newf[@]}")
+if [ ${#cand[@]} -gt 1 ]; then                    # 同 cwd 并发任务:再用简报特征行区分
+    key=$(grep -vE '["\\]' "$brief" | awk 'length(s)<length($0){s=$0} END{print s}' | cut -c1-120)
+    if [ -n "$key" ]; then
+        c2=(); for f in "${cand[@]}"; do grep -m1 -qF "$key" "$f" 2>/dev/null && c2+=("$f"); done
+        ((${#c2[@]})) && cand=("${c2[@]}")
+    fi
+fi
+if ((${#cand[@]})); then
+    rollout="${cand[0]}"; b=$(basename "$rollout" .jsonl); sid="${b: -36}"
+fi
+
+{
+    if [ -n "$last" ]; then printf '%s\n' "$last"
+    else printf '(notify 回调里没有 last-assistant-message,原始 JSON 见 %s)\n' "$json"; fi
+    printf '\n---\n[codex-tmux] 完成 %s  pane=%s\n' "$(date '+%F %T')" "$pane_id"
+    if [ -n "$sid" ]; then
+        printf '[codex-tmux] session-id: %s\n[codex-tmux] rollout: %s\n' "$sid" "$rollout"
+        [ ${#cand[@]} -gt 1 ] && printf '[codex-tmux] 注意:候选 session 有 %s 个,以上取第一个\n' "${#cand[@]}"
+        printf '[codex-tmux] 续聊: codex-tmux --resume %s -t %s -o <新终报> --brief <追问文件>\n' "$sid" "$title"
+    fi
+} > "$report"
+
+capture
+tmux set-option -p -t "$pane_id" remain-on-exit off 2>/dev/null || true
+tmux select-pane -t "$pane_id" -T "cx:$title ✅" 2>/dev/null || true
+if [ "$close_pane" = 1 ]; then tmux kill-pane -t "$pane_id" 2>/dev/null; reg_prune; fi
+echo "[codex-tmux] 完成 终报=$report session=$sid pane=$pane_id(窗格保留可续聊;关闭=codex-tmux kill $title)"
+exit 0
