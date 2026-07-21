@@ -36,6 +36,7 @@ codex-tmux -t <任务名> -o <终报路径> -C <工作目录> --brief <简报文
 ## 简报与并行
 
 - 简报自包含:合同/判据/上下文文件/产物路径全进 prompt,产物落盘 + 终报。
+- **分层终报契约(每份简报照抄进交付要求)**:终报双文件——`<名>.report.md` 摘要 **≤50 行**(必含:判决/交付物清单/各门禁一行退出码/**任何军规触碰、偏离、未达标、自作判断**——偏离只许写在摘要正文,不许用"见附录"替代)+ `<名>.evidence.md` 附录(全部原始证据:门禁日志、grep 输出、数字详表)。唤醒后**只读摘要**,附录按需 grep/定点 Read,永不全文读;lastmsg 转储仅报告缺失时兜底。
 - codex 执行命令慢:拆独立自包含子任务,一条消息批发 N 个后台任务,先完者先处理;批内不写同一文件、不抢同一 GPU/核区,真串行才链式。每任务独立 `-t`/`-o`;窗格没空间时自动转独立 window(`cx:<任务名>`)。
 
 ## resume(小追问;大转向重开)
@@ -44,7 +45,7 @@ codex-tmux -t <任务名> -o <终报路径> -C <工作目录> --brief <简报文
 codex-tmux --resume <session-id|last> -t <任务名> -o <新终报> --brief <追问文件> -- -c 'model_reasoning_effort="max"'
 ```
 
-- **不传 `-C`** 即继承原会话 cwd;session-id 直接抄上一份终报尾部 `[codex-tmux] session-id` 行(兜底:按 workdir grep `~/.codex/sessions/<日期>/rollout-*.jsonl`,文件名尾段 36 位即 id)。
+- **不传 `-C`** 即沿用原会话 cwd:脚本会从 rollout 反查会话最后记录的 cwd 并显式传给 codex(不能真靠"继承"——codex 拿进程当前目录与会话记录比对,不一致会弹交互式目录选择器,无人值守窗格永久卡住,2026-07-18 实证;反查失败会打警告并退回旧行为,此时用 `tmux send-keys` 选 "Use session directory" 解卡)。session-id 直接抄上一份终报尾部 `[codex-tmux] session-id` 行(兜底:按 workdir grep `~/.codex/sessions/<日期>/rollout-*.jsonl`,文件名尾段 36 位即 id)。
 - `-c` effort 不随 session 持久,每次要传。
 
 ## 窗格管理(镜像 agent-team 登记/清理逻辑)

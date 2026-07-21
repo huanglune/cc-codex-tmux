@@ -141,6 +141,29 @@ extra=("$@")
 [ -n "$report" ] || { echo "codex-tmux: 缺少 -o <终报路径>" >&2; exit 2; }
 
 report=$(realpath -m -- "$report"); mkdir -p "$(dirname "$report")"
+
+# resume 且未显式 -C:从 rollout 反查会话最后记录的 cwd 并显式采用。codex 会拿进程当前
+# 目录与会话记录比对,不一致就弹交互式目录选择器,无人值守窗格会永久卡住(2026-07-18 实证)。
+# 反查失败则退回旧行为(不传 -C,可能弹选择器,需人工/send-keys 处理)。
+if [ -n "$resume_id" ] && [ "$workdir_set" = 0 ]; then
+    _sessdir="${CODEX_HOME:-$HOME/.codex}/sessions"
+    if [ "$resume_id" = last ]; then
+        _rollout=$(ls -t "$_sessdir"/*/*/*/rollout-*.jsonl 2>/dev/null | head -1)
+    else
+        _rollout=$(ls -t "$_sessdir"/*/*/*/rollout-*"$resume_id"*.jsonl 2>/dev/null | head -1)
+    fi
+    if [ -n "$_rollout" ]; then
+        _sess_cwd=$(grep -o '"cwd":"[^"]*"' "$_rollout" | tail -1 | sed 's/^"cwd":"//;s/"$//')
+        if [ -n "$_sess_cwd" ] && [ -d "$_sess_cwd" ]; then
+            workdir="$_sess_cwd"; workdir_set=1
+        else
+            echo "codex-tmux: 警告:resume 会话 cwd 反查失败,可能弹目录选择器" >&2
+        fi
+    else
+        echo "codex-tmux: 警告:未找到 resume 会话 rollout,可能弹目录选择器" >&2
+    fi
+fi
+
 workdir=$(realpath -m -- "$workdir")
 [ -n "$title" ] || { title=$(basename "$report"); title="${title%%.*}"; }
 
@@ -201,7 +224,8 @@ for f in "${extra[@]}"; do [ "$f" = --skip-git-repo-check ] || tuiflags+=("$f");
     printf 'exec codex'
     [ -n "$resume_id" ] && printf ' resume'
     ((${#bypassflag[@]})) && printf ' %q' "${bypassflag[@]}"
-    # resume 且未显式 -C:不传,继承原会话 cwd
+    # resume 时 workdir 已在参数解析后由 rollout 反查回填(workdir_set=1);仅当反查
+    # 失败才落到不传 -C 的旧行为(codex 可能弹目录选择器)。
     if [ -z "$resume_id" ] || [ "$workdir_set" = 1 ]; then
         printf ' -C %q' "$workdir"
         printf ' -c %q' "projects.\"$workdir\".trust_level=\"trusted\""

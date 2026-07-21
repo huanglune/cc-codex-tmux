@@ -79,7 +79,7 @@ codex-tmux --resume <session-id|last> -t <task-name> -o <new-report> \
     --brief <follow-up-file> -- -c 'model_reasoning_effort="max"'
 ```
 
-Session ID is printed at the bottom of each report. Omit `-C` to inherit the original session's working directory.
+Session ID is printed at the bottom of each report. Omit `-C` to reuse the original session's working directory; the script recovers it from the session rollout and passes it to Codex explicitly, avoiding an unattended directory-selection prompt.
 
 ### Pane management
 
