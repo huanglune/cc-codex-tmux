@@ -16,7 +16,8 @@
 #   --brief FILE  任务简报文件;缺省从 stdin 读(兼容 `< 简报` 习惯)
 #   --resume ID   续聊:codex resume <ID>;ID=last → --last
 #   -w            用独立 tmux window(名 cx:<标题>)代替分割 pane
-#   --close       完成后关闭窗格(默认保留,可继续在窗格里与 codex 对话)
+#   --close       完成后关闭窗格(默认保留,可继续在窗格里与 codex 对话;
+#                 全局默认用 CODEX_TMUX_CLOSE_DONE=1 打开,免每次加旗标)
 #   --timeout S   等待上限秒(默认 0=不限);超时退出 124,codex 本体继续跑
 #
 # 机制:
@@ -33,13 +34,19 @@
 #   * 终报尾部附 session-id 与 resume 提示(从 $CODEX_HOME/sessions 新增 rollout 反查);
 #   * 不在 tmux → 自动降级 codex exec 黑盒模式(自动补 --skip-git-repo-check,-o 语义不变);
 #   * 窗格死亡且未完成 → 退出 2(现场保留在死窗格 + REPORT.pane.log);
-#   * 工作目录自动预信任(-c projects."<dir>".trust_level="trusted"),新目录不弹信任提示。
+#   * 工作目录自动预信任:启动前幂等写 config.toml [projects."<dir>"] trust_level 条目
+#     (0.144.x 起信任判定只认 config.toml 精确条目,父目录信任不下传、CLI -c 覆盖不免弹),
+#     另附 -c projects...trust_level 覆盖作兜底。
+#   * 启动期弹窗看门狗:等待期前 180s 每 ~10s 抓屏,命中"目录信任"弹窗自动接受
+#     (预信任落盘之外的版本变更兜底);未知弹窗不自动作答,交人工/超时处理。
 #   依赖:bash≥4.4、tmux≥3.2、codex CLI、GNU coreutils;jq/node/python3 任一(提取终报,
 #        全缺时终报只留原始 JSON 指针,不影响流程)。
 #   环境变量:CODEX_TMUX_MODE=pane|window|exec、CODEX_TMUX_PANE_WIDTH(默认 70%)、
 #            CODEX_TMUX_MAIN_WIDTH(默认 30%)、CODEX_TMUX_LAYOUT=main-vertical|none、
 #            CODEX_TMUX_BYPASS=1|0(默认 1=--dangerously-bypass-approvals-and-sandbox;
 #              0=codex 默认审批/沙箱,审批弹窗直接在窗格里人工处理)、
+#            CODEX_TMUX_CLOSE_DONE=1(全局默认完成即关窗格,等价每次加 --close;
+#              续聊靠 session-id 反查不依赖窗格存活,故关窗无损 resume)、
 #            CODEX_HOME(session 反查目录,默认 ~/.codex)
 
 set -u
@@ -121,7 +128,7 @@ esac
 
 # ============ 派发参数解析 ============
 title="" report="" workdir="$PWD" workdir_set=0 brief="" resume_id="" mode="${CODEX_TMUX_MODE:-pane}"
-close_pane=0 timeout=0
+close_pane=${CODEX_TMUX_CLOSE_DONE:-0} timeout=0
 while [ $# -gt 0 ]; do
     case "$1" in
         -t) title="$2"; shift 2 ;;
@@ -216,6 +223,14 @@ fi
     printf ': > %q\n' "$donef"
 } > "$notify_sh"; chmod +x "$notify_sh"
 
+# ---------- 预信任落盘:codex 0.144.x 信任判定只认 config.toml 精确条目(父目录不下传、CLI -c 不免弹) ----------
+if [ -z "$resume_id" ] || [ "$workdir_set" = 1 ]; then
+    codex_cfg="${CODEX_HOME:-$HOME/.codex}/config.toml"
+    if [ -d "${codex_cfg%/*}" ] && ! grep -qsF "[projects.\"$workdir\"]" "$codex_cfg"; then
+        printf '\n[projects."%s"]\ntrust_level = "trusted"\n' "$workdir" >> "$codex_cfg"
+    fi
+fi
+
 # ---------- 生成窗格启动脚本:真 codex TUI + 简报作为首条 prompt ----------
 tuiflags=()
 for f in "${extra[@]}"; do [ "$f" = --skip-git-repo-check ] || tuiflags+=("$f"); done
@@ -279,6 +294,7 @@ capture() { tmux capture-pane -p -S - -t "$pane_id" > "$panelog" 2>/dev/null || 
 
 # ---------- 等 notify 完成信号 ----------
 start=$SECONDS
+popup_guard=0
 while [ ! -e "$donef" ]; do
     dead=$(tmux display-message -p -t "$pane_id" '#{pane_dead}' 2>/dev/null) || dead=gone
     if [ "$dead" = 1 ] || [ "$dead" = gone ]; then
@@ -292,6 +308,15 @@ while [ ! -e "$donef" ]; do
         echo "codex-tmux: 等待 ${timeout}s 超时,codex 仍在 pane=$pane_id 里跑;稍后自查 $json" >&2
         exit 124
     fi
+    # 启动期弹窗看门狗:前 180s 每 ~10s 抓屏一次,命中已知安全弹窗(目录信任)自动接受。
+    # 预信任落盘是第一道防线,此为版本变更兜底;未知弹窗不自动作答(可能选错),交人工/超时处理。
+    if [ $((SECONDS - start)) -lt 180 ] && [ $((popup_guard % 5)) -eq 0 ]; then
+        if tmux capture-pane -p -t "$pane_id" 2>/dev/null | grep -qF 'Do you trust the contents of this directory'; then
+            tmux send-keys -t "$pane_id" Enter
+            echo "[codex-tmux] 检测到目录信任弹窗,已自动接受(预信任应已覆盖,此为兜底)" >&2
+        fi
+    fi
+    popup_guard=$((popup_guard + 1))
     sleep 2
 done
 
