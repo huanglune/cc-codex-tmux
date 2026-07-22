@@ -48,11 +48,45 @@ codex-tmux --resume <session-id|last> -t <任务名> -o <新终报> --brief <追
 - **不传 `-C`** 即沿用原会话 cwd:脚本会从 rollout 反查会话最后记录的 cwd 并显式传给 codex(不能真靠"继承"——codex 拿进程当前目录与会话记录比对,不一致会弹交互式目录选择器,无人值守窗格永久卡住,2026-07-18 实证;反查失败会打警告并退回旧行为,此时用 `tmux send-keys` 选 "Use session directory" 解卡)。session-id 直接抄上一份终报尾部 `[codex-tmux] session-id` 行(兜底:按 workdir grep `~/.codex/sessions/<日期>/rollout-*.jsonl`,文件名尾段 36 位即 id)。
 - `-c` effort 不随 session 持久,每次要传。
 
+## 中途转向(向在飞窗格发消息)
+
+在飞任务要插手(补指令、纠偏、改范围)时不重开会话,直接把消息打进窗格。**三段式,Enter 必须单独一步**:
+
+```
+tmux set-buffer -b steer '<消息文本>'
+tmux paste-buffer -d -b steer -t <pane_id>
+tmux send-keys -t <pane_id> Enter          # 单独发;与 paste 同链连发会被吞
+tmux capture-pane -p -t <pane_id> | tail -8   # 验证到达,不许盲发即走
+```
+
+- **Enter 吞没坑(2026-07-22 实证)**:bracketed-paste 结束序列未处理完时,紧跟的 Enter 被当作粘贴内容处理——消息滞留输入框,任务永远收不到。paste 与 Enter 必须分开;发完必 capture 验证。
+- 验证判据:看到 "Messages to be submitted after next tool call"(codex mid-turn 排队投递,正常)或消息已入对话区即成;仍见 `› <你的文本>` 挂在输入框则再补一记 `send-keys Enter`。
+- mid-turn 消息在下一次工具调用结束后注入;要立即打断先 `send-keys Escape`(慎用,中断当前动作)。
+- 大转向仍按 resume 节重开会话,长 prompt 纠偏不可靠。
+
 ## 窗格管理(镜像 agent-team 登记/清理逻辑)
 
 - `codex-tmux list`:列出登记窗格——pane_id、任务名、状态(运行中/完成/死亡)、位置、终报路径;每次先按现存 pane 对账清死条目。
 - `codex-tmux kill <任务名|%pane_id|done|all>`:定向/批量关闭并注销(`done`=只关已完成,`all`=全关;重名时会列出候选并要求改用 `%pane_id`)。用户说"关掉某个/所有 codex 窗格"时用它,不要手拼 `tmux kill-pane`。
+- **完成窗格停留的处理**:窗格默认完成后**保留**(为可续聊),这是默认态、不是 bug。三种清法——①读完终报随手 `codex-tmux kill done` 批量清已完成;②单次派发加 `--close` 完成即关;③嫌每次麻烦就 `export CODEX_TMUX_CLOSE_DONE=1` 全局默认完成即关。关窗不影响 resume(靠 session-id 从磁盘反查)。
 - 登记簿:`${XDG_CACHE_HOME:-~/.cache}/codex-tmux/registry.tsv`(pane_id/任务名/终报/工作目录/启动时间/边框色)。
+
+## 弹窗根治(无人值守窗格不被交互提示卡死)
+
+codex TUI 的交互弹窗会让无人值守窗格永久卡住,进度停滞。分两道处理:
+
+- **脚本已内建(默认开,无需加参数)**:①工作目录预信任——启动前幂等把 `[projects."<workdir>"] trust_level = "trusted"` 写进 `config.toml`(0.144.x 起信任判定只认 config.toml 精确条目,父目录信任不下传、CLI `-c` 覆盖也不免弹),另附 `-c` 覆盖兜底;②启动期弹窗看门狗——等待期前 180s 每 ~10s 抓屏,命中"目录信任"弹窗自动接受(版本变更兜底)。未知类型弹窗**不自动作答**(可能选错项),交人工或 `--timeout` 处理。
+- **建议写进 `~/.codex/config.toml`**(用户机器级设置,非本 skill 分发内容;各人 config 含自有 provider/base_url,勿提交进任何仓库):
+
+  ```toml
+  check_for_update_on_startup = false      # 关启动版本更新提示
+
+  [notice]
+  hide_rate_limit_model_nudge = true       # 关限流时的换模型建议
+  hide_full_access_warning = true          # 关 bypass 沙箱的全权限警告
+  ```
+
+- **核选项**:某任务完全不需可视/插手时,`CODEX_TMUX_MODE=exec` 走 `codex exec` 非交互模式,架构上不可能提问(代价=黑盒,无窗格、不能中途对话)。
 
 ## 失败样态与排障
 
@@ -62,7 +96,7 @@ codex-tmux --resume <session-id|last> -t <任务名> -o <新终报> --brief <追
 
 ## 旋钮
 
-- 环境变量:`CODEX_TMUX_MODE=pane|window|exec`、`CODEX_TMUX_LAYOUT=main-vertical|none`、`CODEX_TMUX_PANE_WIDTH`(首切宽,默认 `70%`)、`CODEX_TMUX_MAIN_WIDTH`(主窗格宽,默认 `30%`)、`CODEX_TMUX_BYPASS=1|0`(默认 1)、`CODEX_HOME`(session 反查,默认 `~/.codex`)。
+- 环境变量:`CODEX_TMUX_MODE=pane|window|exec`、`CODEX_TMUX_LAYOUT=main-vertical|none`、`CODEX_TMUX_PANE_WIDTH`(首切宽,默认 `70%`)、`CODEX_TMUX_MAIN_WIDTH`(主窗格宽,默认 `30%`)、`CODEX_TMUX_BYPASS=1|0`(默认 1)、`CODEX_TMUX_CLOSE_DONE=1`(全局默认完成即关窗格,免每次加 `--close`;续聊靠 session-id 反查不依赖窗格存活,关窗无损 resume)、`CODEX_HOME`(session 反查,默认 `~/.codex`)。
 - 单次:`-w`=独立 window;`--close`=完成即关窗格;`--timeout <秒>`。
 
 ## 用户 /codex <任务> 直呼时
