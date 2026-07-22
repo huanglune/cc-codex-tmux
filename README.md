@@ -20,6 +20,7 @@ Claude Code can delegate sub-tasks to Codex CLI. Without this skill, delegation 
 - **Parallel dispatch** — Spin up N independent tasks in one batch; each gets its own pane, title, and report path.
 - **Resume** — Continue a previous Codex session with `--resume <session-id|last>`.
 - **Pane management** — `list` / `kill <name|%id|done|all>` commands with a registry that auto-prunes dead panes.
+- **Prompt-proof for unattended runs** — Auto pre-trusts the working directory (writes a `config.toml` project entry, since Codex 0.144.x only honors exact entries) and runs a startup watchdog that auto-accepts the directory-trust prompt, so panes don't hang on interactive dialogs.
 - **Graceful degradation** — No tmux? Falls back to `codex exec` (headless) with identical `-o` semantics.
 - **Notify integration** — Uses Codex's official notify callback to capture the final response and session ID.
 - **Zero install** — Pure bash script; no build step, no package manager.
@@ -68,7 +69,7 @@ codex-tmux -t <task-name> -o <report-path> -C <workdir> --brief <brief-file> \
 | `--brief FILE` | Task brief file; omit to read from stdin |
 | `--resume ID` | Resume a previous session (`ID` or `last`) |
 | `-w` | Use a separate tmux window instead of a split pane |
-| `--close` | Close the pane on completion (default: keep for follow-up) |
+| `--close` | Close the pane on completion (default: keep for follow-up; set `CODEX_TMUX_CLOSE_DONE=1` to make this the global default) |
 | `--timeout S` | Max wait seconds (0 = unlimited); exits 124 on timeout |
 | `-- ...` | Extra flags passed directly to `codex` (after `--`) |
 
@@ -91,6 +92,8 @@ codex-tmux kill done              # Kill all completed panes
 codex-tmux kill all               # Kill everything
 ```
 
+Panes are **kept after completion by default** (so you can resume in-pane) — this is intended, not a leak. To clean them up: run `codex-tmux kill done` after reading reports, pass `--close` per-dispatch, or `export CODEX_TMUX_CLOSE_DONE=1` to auto-close globally. Closing a pane never breaks `--resume` (session state lives on disk, looked up by session ID).
+
 ## Environment Variables
 
 | Variable | Default | Description |
@@ -100,6 +103,7 @@ codex-tmux kill all               # Kill everything
 | `CODEX_TMUX_MAIN_WIDTH` | `30%` | Main pane width when >2 panes trigger `main-vertical` |
 | `CODEX_TMUX_LAYOUT` | `main-vertical` | `main-vertical` / `none` |
 | `CODEX_TMUX_BYPASS` | `1` | `1` = `--dangerously-bypass-approvals-and-sandbox`; `0` = default Codex approval flow |
+| `CODEX_TMUX_CLOSE_DONE` | `0` | `1` = auto-close the pane on completion (global default for `--close`); resume is unaffected |
 | `CODEX_HOME` | `~/.codex` | Session lookup directory |
 
 ## Report Format
@@ -147,6 +151,20 @@ Claude Code main session
 By default, `CODEX_TMUX_BYPASS=1` passes `--dangerously-bypass-approvals-and-sandbox` to Codex. This is designed for isolated environments (containers, VMs) where bubblewrap can't run.
 
 For shared or production machines, set `CODEX_TMUX_BYPASS=0` — Codex will use its normal approval flow, and you can interact with approval prompts directly in the tmux pane.
+
+## Suppressing Interactive Prompts
+
+Codex TUI dialogs can stall an unattended pane. `codex-tmux` handles the **directory-trust** prompt for you (auto pre-trust + startup watchdog, both on by default — no flags needed). The remaining prompts are Codex-level nudges best silenced once in `~/.codex/config.toml` — this is your own machine-level config (keep your provider/`base_url` there private; never commit it):
+
+```toml
+check_for_update_on_startup = false      # startup update-check prompt
+
+[notice]
+hide_rate_limit_model_nudge = true       # "switch model?" nudge on rate limits
+hide_full_access_warning = true          # full-access warning under bypass sandbox
+```
+
+For a task that needs no visibility at all, `CODEX_TMUX_MODE=exec` runs headless (`codex exec`), which cannot prompt by construction.
 
 ## License
 
