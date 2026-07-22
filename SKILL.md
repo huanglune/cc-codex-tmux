@@ -60,7 +60,8 @@ tmux capture-pane -p -t <pane_id> | tail -8   # 验证到达,不许盲发即走
 ```
 
 - **Enter 吞没坑(2026-07-22 实证)**:bracketed-paste 结束序列未处理完时,紧跟的 Enter 被当作粘贴内容处理——消息滞留输入框,任务永远收不到。paste 与 Enter 必须分开;发完必 capture 验证。
-- 验证判据:看到 "Messages to be submitted after next tool call"(codex mid-turn 排队投递,正常)或消息已入对话区即成;仍见 `› <你的文本>` 挂在输入框则再补一记 `send-keys Enter`。
+- **paste 整段丢失坑(2026-07-22 实证)**:重度重绘中(长任务高频输出)的窗格,`paste-buffer` 可能整段无痕丢失(输入框与 scrollback 均无)。稳妥路径:`tmux send-keys -t <pane> -l '<消息>'` 直打 → capture 验证文本已入框 → 单独 Enter。
+- 验证判据(两代 UI 二选一):旧版回显 `↳ <消息>` 或 "Messages to be submitted after next tool call";新版 TUI **静默排队**(2026-07-22 实证)——Enter 后输入框清空、无任何回显、任务不中断即=已入队,下个工具边界注入。标准流程=发前验"文本在框"、发后验"框已清空且任务未断";两者过即送达,勿因无回显反复重发(消息写成幂等通告体)。仍见 `› <你的文本>` 挂框则补一记 `send-keys Enter`。
 - mid-turn 消息在下一次工具调用结束后注入;要立即打断先 `send-keys Escape`(慎用,中断当前动作)。
 - 大转向仍按 resume 节重开会话,长 prompt 纠偏不可靠。
 
