@@ -48,6 +48,22 @@ codex-tmux --resume <session-id|last> -t <任务名> -o <新终报> --brief <追
 - **不传 `-C`** 即沿用原会话 cwd:脚本会从 rollout 反查会话最后记录的 cwd 并显式传给 codex(不能真靠"继承"——codex 拿进程当前目录与会话记录比对,不一致会弹交互式目录选择器,无人值守窗格永久卡住,2026-07-18 实证;反查失败会打警告并退回旧行为,此时用 `tmux send-keys` 选 "Use session directory" 解卡)。session-id 直接抄上一份终报尾部 `[codex-tmux] session-id` 行(兜底:按 workdir grep `~/.codex/sessions/<日期>/rollout-*.jsonl`,文件名尾段 36 位即 id)。
 - `-c` effort 不随 session 持久,每次要传。
 
+## 中途转向(向在飞窗格发消息)
+
+在飞任务要插手(补指令、纠偏、改范围)时不重开会话,直接把消息打进窗格。**三段式,Enter 必须单独一步**:
+
+```
+tmux set-buffer -b steer '<消息文本>'
+tmux paste-buffer -d -b steer -t <pane_id>
+tmux send-keys -t <pane_id> Enter          # 单独发;与 paste 同链连发会被吞
+tmux capture-pane -p -t <pane_id> | tail -8   # 验证到达,不许盲发即走
+```
+
+- **Enter 吞没坑(2026-07-22 实证)**:bracketed-paste 结束序列未处理完时,紧跟的 Enter 被当作粘贴内容处理——消息滞留输入框,任务永远收不到。paste 与 Enter 必须分开;发完必 capture 验证。
+- 验证判据:看到 "Messages to be submitted after next tool call"(codex mid-turn 排队投递,正常)或消息已入对话区即成;仍见 `› <你的文本>` 挂在输入框则再补一记 `send-keys Enter`。
+- mid-turn 消息在下一次工具调用结束后注入;要立即打断先 `send-keys Escape`(慎用,中断当前动作)。
+- 大转向仍按 resume 节重开会话,长 prompt 纠偏不可靠。
+
 ## 窗格管理(镜像 agent-team 登记/清理逻辑)
 
 - `codex-tmux list`:列出登记窗格——pane_id、任务名、状态(运行中/完成/死亡)、位置、终报路径;每次先按现存 pane 对账清死条目。
