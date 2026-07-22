@@ -20,7 +20,7 @@ Claude Code can delegate sub-tasks to Codex CLI. Without this skill, delegation 
 - **Parallel dispatch** — Spin up N independent tasks in one batch; each gets its own pane, title, and report path.
 - **Resume** — Continue a previous Codex session with `--resume <session-id|last>`.
 - **Pane management** — `list` / `kill <name|%id|done|all>` commands with a registry that auto-prunes dead panes.
-- **Prompt-proof for unattended runs** — Auto pre-trusts the working directory (writes a `config.toml` project entry, since Codex 0.144.x only honors exact entries) and runs a startup watchdog that auto-accepts the directory-trust prompt, so panes don't hang on interactive dialogs.
+- **Prompt-proof for unattended runs** — Default bypass posture kills approval/trust dialogs at the root: launches with `--dangerously-bypass-approvals-and-sandbox` (plus `--dangerously-bypass-hook-trust` when the CLI supports it) and pre-trusts the working directory inline via `-c`, so panes don't hang on interactive dialogs.
 - **Graceful degradation** — No tmux? Falls back to `codex exec` (headless) with identical `-o` semantics.
 - **Notify integration** — Uses Codex's official notify callback to capture the final response and session ID.
 - **Zero install** — Pure bash script; no build step, no package manager.
@@ -154,7 +154,7 @@ For shared or production machines, set `CODEX_TMUX_BYPASS=0` — Codex will use 
 
 ## Suppressing Interactive Prompts
 
-Codex TUI dialogs can stall an unattended pane. `codex-tmux` handles the **directory-trust** prompt for you (auto pre-trust + startup watchdog, both on by default — no flags needed). The remaining prompts are Codex-level nudges best silenced once in `~/.codex/config.toml` — this is your own machine-level config (keep your provider/`base_url` there private; never commit it):
+Codex TUI dialogs can stall an unattended pane. By default `codex-tmux` suppresses approval/trust dialogs at the root (bypass flags + inline pre-trust of the working directory — no flags needed; with `CODEX_TMUX_BYPASS=0` you answer prompts in the pane yourself). The remaining prompts are Codex-level nudges best silenced once in `~/.codex/config.toml` — this is your own machine-level config (keep your provider/`base_url` there private; never commit it):
 
 ```toml
 check_for_update_on_startup = false      # startup update-check prompt

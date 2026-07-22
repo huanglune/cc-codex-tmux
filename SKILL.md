@@ -75,7 +75,7 @@ tmux capture-pane -p -t <pane_id> | tail -8   # 验证到达,不许盲发即走
 
 codex TUI 的交互弹窗会让无人值守窗格永久卡住,进度停滞。分两道处理:
 
-- **脚本已内建(默认开,无需加参数)**:①工作目录预信任——启动前幂等把 `[projects."<workdir>"] trust_level = "trusted"` 写进 `config.toml`(0.144.x 起信任判定只认 config.toml 精确条目,父目录信任不下传、CLI `-c` 覆盖也不免弹),另附 `-c` 覆盖兜底;②启动期弹窗看门狗——等待期前 180s 每 ~10s 抓屏,命中"目录信任"弹窗自动接受(版本变更兜底)。未知类型弹窗**不自动作答**(可能选错项),交人工或 `--timeout` 处理。
+- **脚本已内建(默认开,无需加参数)**:默认 bypass 姿态从根上关掉审批/信任类弹窗——启动命令带 `--dangerously-bypass-approvals-and-sandbox`,CLI 支持时(探测 `codex --help`)追加 `--dangerously-bypass-hook-trust`,并以 `-c 'projects."<workdir>".trust_level="trusted"'` 内联预信任兜底;不写 config.toml、无启动期抓屏看门狗(旧版机制,已被 bypass 根治取代)。`CODEX_TMUX_BYPASS=0` 走 codex 原生审批时弹窗会正常出现——窗格本来就是交互的,人工在窗格里作答或 `--timeout` 兜底。
 - **建议写进 `~/.codex/config.toml`**(用户机器级设置,非本 skill 分发内容;各人 config 含自有 provider/base_url,勿提交进任何仓库):
 
   ```toml
