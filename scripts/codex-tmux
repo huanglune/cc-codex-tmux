@@ -1,268 +1,734 @@
 #!/usr/bin/env bash
-# codex-tmux — 在 tmux 窗格里跑「交互式 codex TUI」执行任务,主会话仍走后台退出唤醒。
-#
-# 派发(Bash run_in_background 调用):
-#   codex-tmux -t <标题> -o <终报路径> -C <工作目录> --brief <简报文件> \
-#       [-- <额外 codex 旗标,如 -c 'model_reasoning_effort="max"'>]
-#   codex-tmux --resume <session-id|last> -t ... -o ... --brief <追问文件> [-- ...]
-# 窗格管理(镜像 claude agent-team TmuxBackend 的登记/清理逻辑):
-#   codex-tmux list                              列出登记窗格(状态/位置/终报)
-#   codex-tmux kill <任务名|%pane_id|done|all>   定向/批量关闭并注销
-#
-# 选项:
-#   -t TITLE      窗格标题(默认取 -o 文件名)
-#   -o REPORT     最终回复落盘路径(必填;辅助文件 REPORT.notify.json/.pane.log 等同目录)
-#   -C DIR        codex 工作目录(默认当前目录)
-#   --brief FILE  任务简报文件;缺省从 stdin 读(兼容 `< 简报` 习惯)
-#   --resume ID   续聊:codex resume <ID>;ID=last → --last
-#   -w            用独立 tmux window(名 cx:<标题>)代替分割 pane
-#   --close       完成后关闭窗格(默认保留,可继续在窗格里与 codex 对话)
-#   --timeout S   等待上限秒(默认 0=不限);超时退出 124,codex 本体继续跑
-#
-# 机制:
-#   * 窗格里是真 codex TUI,进度可视、可插手;布局仿 agent-team(同比):主窗格居左,
-#     首个 cx 窗格 -h 切 CODEX_TMUX_PANE_WIDTH(默认 70%,cx 侧占大头),后续取 cx 区
-#     中位窗格按奇偶交替 -v/-h 再切,>2 窗格时 main-vertical + 主窗格收
-#     CODEX_TMUX_MAIN_WIDTH(默认 30%);
-#   * 每窗格独立边框色(agent-team setPaneBorderColor/setPaneTitle 同款);标题钉死:
-#     pane 级 allow-set-title off,codex 的 OSC 改名失效,边框恒显 cx:<标题>,完成变 ✅;
-#   * 登记簿:${XDG_CACHE_HOME:-~/.cache}/codex-tmux/registry.tsv 记
-#     pane_id/标题/终报/工作目录/启动时间/边框色;list/kill 先按 live pane 对账清死条目;
-#   * 完成检测走 codex 官方 notify 接口:-c 'notify=["<脚本>"]',agent-turn-complete
-#     回调取 last-assistant-message 写入 -o,本进程退出 → 唤醒主会话;
-#   * 终报尾部附 session-id 与 resume 提示(从 $CODEX_HOME/sessions 新增 rollout 反查);
-#   * 不在 tmux → 自动降级 codex exec 黑盒模式(自动补 --skip-git-repo-check,-o 语义不变);
-#   * 窗格死亡且未完成 → 退出 2(现场保留在死窗格 + REPORT.pane.log);
-#   * 工作目录自动预信任(-c projects."<dir>".trust_level="trusted"),新目录不弹信任提示。
-#   依赖:bash≥4.4、tmux≥3.2、codex CLI、GNU coreutils;jq/node/python3 任一(提取终报,
-#        全缺时终报只留原始 JSON 指针,不影响流程)。
-#   环境变量:CODEX_TMUX_MODE=pane|window|exec、CODEX_TMUX_PANE_WIDTH(默认 70%)、
-#            CODEX_TMUX_MAIN_WIDTH(默认 30%)、CODEX_TMUX_LAYOUT=main-vertical|none、
-#            CODEX_TMUX_BYPASS=1|0(默认 1=--dangerously-bypass-approvals-and-sandbox;
-#              0=codex 默认审批/沙箱,审批弹窗直接在窗格里人工处理)、
-#            CODEX_HOME(session 反查目录,默认 ~/.codex)
+# codex-tmux — 在 tmux pane/window 中运行可视 Codex TUI，并以官方 notify 回调交付结果。
+# 默认面向已有外部隔离边界的自动化环境：关闭 Codex 内层审批/沙箱与 hook trust。
 
 set -u
 
-# ============ 登记簿与窗格管理(镜像 agent-team TmuxBackend) ============
-REG_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/codex-tmux"
-REG="$REG_DIR/registry.tsv"   # pane_id \t 标题 \t 终报 \t 工作目录 \t 启动时间 \t 边框色
+SELF=$(realpath -m -- "$0" 2>/dev/null || printf '%s' "$0")
+REG_DIR="${CODEX_TMUX_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/codex-tmux}"
+REG="$REG_DIR/registry.tsv"       # pane_id, title, report, cwd, started, color
+SESS="$REG_DIR/sessions.tsv"     # thread_id, cwd, report, epoch, mode
+REG_LOCK="$REG_DIR/registry.lock"
 CX_COLORS=(colour45 colour208 colour118 colour171 colour214 colour87 colour203 colour155)
 
-reg_prune() {   # 按现存 pane 对账,清掉死条目
+die() { echo "codex-tmux: $*" >&2; exit 2; }
+
+usage() {
+    cat <<'EOF'
+codex-tmux — 在 tmux pane/window 中运行可视 Codex TUI，并用 notify 自动交付。
+
+用法:
+  codex-tmux -t TITLE -o REPORT [-C DIR] [--brief FILE] [--timeout S] [--close] [--] [CODEX FLAGS]
+  codex-tmux --resume <SESSION_ID|last> -t TITLE -o REPORT [--brief FILE] [--] [CODEX FLAGS]
+  codex-tmux list
+  codex-tmux kill <TITLE|%PANE|done|all>
+
+自动化默认值:
+  CODEX_TMUX_BYPASS=1       关闭审批/沙箱，并在 CLI 支持时关闭 hook-trust 提示
+  CODEX_TMUX_REQUIRE_REPORT=1
+                             TUI 仅在 REPORT 非空后交付；缺失时标记“待输入”并继续等待
+  CODEX_TMUX_MODE=pane      pane | window | exec
+EOF
+}
+
+tsv_safe() {
+    case "$1" in *$'\t'*|*$'\n'*|*$'\r'*) return 1 ;; *) return 0 ;; esac
+}
+
+atomic_write() { # stdin -> $1
+    local dest="$1" tmp="${1}.tmp.$$"
+    (umask 077; cat > "$tmp") || { rm -f -- "$tmp"; return 1; }
+    mv -f -- "$tmp" "$dest"
+}
+
+atomic_copy() {
+    local src="$1" dest="$2" tmp="${2}.tmp.$$"
+    (umask 077; cp -- "$src" "$tmp") || { rm -f -- "$tmp"; return 1; }
+    mv -f -- "$tmp" "$dest"
+}
+
+atomic_touch() {
+    local dest="$1" tmp="${1}.tmp.$$"
+    (umask 077; : > "$tmp") || return 1
+    mv -f -- "$tmp" "$dest"
+}
+
+write_state() {
+    local report="$1" state="$2" detail="${3:-}" tmp="${1}.state.tmp.$$"
+    detail=${detail//$'\t'/ }
+    detail=${detail//$'\n'/ }
+    detail=${detail//$'\r'/ }
+    (umask 077; printf '%s\t%s\t%s\n' "$state" "$(date +%s)" "$detail" > "$tmp") || return 1
+    mv -f -- "$tmp" "$report.state"
+}
+
+read_state() {
+    local report="$1" state=""
+    if [ -s "$report.state" ]; then IFS=$'\t' read -r state _ < "$report.state" || true; fi
+    printf '%s' "$state"
+}
+
+derive_evidence() {
+    case "$1" in
+        *.report.md) printf '%s.evidence.md' "${1%.report.md}" ;;
+        *)           printf '%s.evidence.md' "$1" ;;
+    esac
+}
+
+# ---------- registry/session lock ----------
+REG_LOCK_KIND="" REG_LOCK_FD="" REG_LOCK_DIR="${REG_LOCK}.d"
+
+reg_lock_acquire() {
+    mkdir -p -- "$REG_DIR" || return 1
+    if command -v flock >/dev/null 2>&1; then
+        exec {REG_LOCK_FD}>"$REG_LOCK" || return 1
+        flock "$REG_LOCK_FD" || return 1
+        REG_LOCK_KIND=flock
+        return 0
+    fi
+
+    local i owner
+    for ((i=0; i<200; i++)); do
+        if mkdir "$REG_LOCK_DIR" 2>/dev/null; then
+            (umask 077; printf '%s\n' "$$" > "$REG_LOCK_DIR/pid")
+            REG_LOCK_KIND=mkdir
+            return 0
+        fi
+        owner=""
+        [ -r "$REG_LOCK_DIR/pid" ] && read -r owner < "$REG_LOCK_DIR/pid" || true
+        if [ -n "$owner" ] && ! kill -0 "$owner" 2>/dev/null; then
+            rm -f -- "$REG_LOCK_DIR/pid"
+            rmdir "$REG_LOCK_DIR" 2>/dev/null || true
+        fi
+        sleep 0.05
+    done
+    echo "codex-tmux: registry lock 超时" >&2
+    return 1
+}
+
+reg_lock_release() {
+    case "$REG_LOCK_KIND" in
+        flock)
+            flock -u "$REG_LOCK_FD" 2>/dev/null || true
+            exec {REG_LOCK_FD}>&-
+            ;;
+        mkdir)
+            rm -f -- "$REG_LOCK_DIR/pid"
+            rmdir "$REG_LOCK_DIR" 2>/dev/null || true
+            ;;
+    esac
+    REG_LOCK_KIND="" REG_LOCK_FD=""
+}
+
+reg_prune_unlocked() {
     [ -s "$REG" ] || return 0
-    local live tmp; live=$(tmux list-panes -a -F '#{pane_id}' 2>/dev/null) || live=""
-    tmp="$REG.tmp.$$"
+    local live tmp="${REG}.tmp.$$"
+    if ! live=$(tmux list-panes -a -F '#{pane_id}' 2>/dev/null); then
+        return 0                    # tmux 暂不可达时保留登记，不能误清空
+    fi
     awk -F'\t' -v live="$live" \
         'BEGIN{n=split(live,a,"\n");for(i=1;i<=n;i++)L[a[i]]=1} ($1 in L)' \
         "$REG" > "$tmp" 2>/dev/null || : > "$tmp"
-    mv -f "$tmp" "$REG"
+    chmod 600 "$tmp" 2>/dev/null || true
+    mv -f -- "$tmp" "$REG"
 }
 
-rebalance() {   # agent-team 同款:>2 窗格时 main-vertical + 主窗格定宽
-    local win="$1" panes n
-    [ "${CODEX_TMUX_LAYOUT:-main-vertical}" = none ] && return 0
-    panes=$(tmux list-panes -t "$win" -F '#{pane_id}' 2>/dev/null) || return 0
-    n=$(grep -c . <<<"$panes")
-    [ "$n" -gt 2 ] || return 0
-    tmux select-layout -t "$win" main-vertical 2>/dev/null || true
-    tmux resize-pane -t "$(head -n1 <<<"$panes")" -x "${CODEX_TMUX_MAIN_WIDTH:-30%}" 2>/dev/null || true
+reg_prune() {
+    reg_lock_acquire || return 1
+    reg_prune_unlocked
+    reg_lock_release
+}
+
+reg_snapshot() {
+    reg_lock_acquire || return 1
+    reg_prune_unlocked
+    [ -s "$REG" ] && cat "$REG"
+    reg_lock_release
+}
+
+reg_add() {
+    local pane="$1" title="$2" report="$3" cwd="$4" started="$5" color="$6"
+    local tmp="${REG}.tmp.$$"
+    reg_lock_acquire || return 1
+    reg_prune_unlocked
+    if [ -s "$REG" ]; then
+        awk -F'\t' -v p="$pane" -v r="$report" '$1!=p && $3!=r' "$REG" > "$tmp"
+    else
+        : > "$tmp"
+    fi
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$pane" "$title" "$report" "$cwd" "$started" "$color" >> "$tmp"
+    chmod 600 "$tmp" 2>/dev/null || true
+    mv -f -- "$tmp" "$REG"
+    reg_lock_release
+}
+
+report_in_use() {
+    local report="$1" found=1
+    reg_lock_acquire || return 0
+    reg_prune_unlocked
+    if [ -s "$REG" ] && awk -F'\t' -v r="$report" '$3==r{found=1} END{exit !found}' "$REG"; then found=0; fi
+    reg_lock_release
+    return "$found"
+}
+
+session_update() {
+    local thread="$1" cwd="$2" report="$3" mode="$4" tmp="${SESS}.tmp.$$"
+    [ -n "$thread" ] || return 0
+    tsv_safe "$thread" && tsv_safe "$cwd" && tsv_safe "$report" || return 0
+    reg_lock_acquire || return 1
+    if [ -s "$SESS" ]; then awk -F'\t' -v id="$thread" '$1!=id' "$SESS" > "$tmp"; else : > "$tmp"; fi
+    printf '%s\t%s\t%s\t%s\t%s\n' "$thread" "$cwd" "$report" "$(date +%s)" "$mode" >> "$tmp"
+    chmod 600 "$tmp" 2>/dev/null || true
+    mv -f -- "$tmp" "$SESS"
+    reg_lock_release
+}
+
+session_lookup() {
+    local id="$1"
+    reg_lock_acquire || return 1
+    [ -s "$SESS" ] && awk -F'\t' -v id="$id" '$1==id{line=$0} END{if(line!="")print line}' "$SESS"
+    reg_lock_release
+}
+
+session_last() {
+    reg_lock_acquire || return 1
+    [ -s "$SESS" ] && tail -n 1 "$SESS"
+    reg_lock_release
+}
+
+# ---------- JSON payload helpers ----------
+JSON_ENGINE=""
+choose_json_engine() {
+    [ -n "$JSON_ENGINE" ] && return 0
+    if command -v node >/dev/null 2>&1; then JSON_ENGINE=node
+    elif command -v python3 >/dev/null 2>&1; then JSON_ENGINE=python3
+    elif command -v jq >/dev/null 2>&1; then JSON_ENGINE=jq
+    else return 1
+    fi
+}
+
+json_valid() {
+    local src="$1"; choose_json_engine || return 1
+    case "$JSON_ENGINE" in
+        node) node -e 'JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"))' "$src" >/dev/null 2>&1 ;;
+        python3) python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$src" >/dev/null 2>&1 ;;
+        jq) jq -e 'type=="object"' "$src" >/dev/null 2>&1 ;;
+    esac
+}
+
+json_scalar() {
+    local src="$1" key="$2"; choose_json_engine || return 1
+    case "$JSON_ENGINE" in
+        node)
+            node -e 'const j=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"));process.stdout.write(String(j[process.argv[2]]??""))' "$src" "$key"
+            ;;
+        python3)
+            python3 -c 'import json,sys; j=json.load(open(sys.argv[1])); sys.stdout.write(str(j.get(sys.argv[2], "") or ""))' "$src" "$key"
+            ;;
+        jq) jq -r --arg k "$key" '.[$k] // empty' "$src" ;;
+    esac
+}
+
+json_extract_last() {
+    local src="$1" dest="$2" tmp="${2}.tmp.$$"; choose_json_engine || return 1
+    case "$JSON_ENGINE" in
+        node)
+            node -e 'const j=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"));process.stdout.write(String(j["last-assistant-message"]??j.last_assistant_message??""))' "$src" > "$tmp"
+            ;;
+        python3)
+            python3 -c 'import json,sys; j=json.load(open(sys.argv[1])); sys.stdout.write(str(j.get("last-assistant-message") or j.get("last_assistant_message") or ""))' "$src" > "$tmp"
+            ;;
+        jq) jq -jr '."last-assistant-message" // .last_assistant_message // empty' "$src" > "$tmp" ;;
+    esac || { rm -f -- "$tmp"; return 1; }
+    chmod 600 "$tmp" 2>/dev/null || true
+    mv -f -- "$tmp" "$dest"
+}
+
+json_write_meta() {
+    local src="$1" dest="$2" mode="$3" pane="$4" title="$5" report="$6" evidence="$7"
+    local tmp="${2}.tmp.$$"; choose_json_engine || return 1
+    case "$JSON_ENGINE" in
+        node)
+            node -e 'const fs=require("fs");const [src,mode,pane,title,report,evidence]=process.argv.slice(1);const j=JSON.parse(fs.readFileSync(src,"utf8"));const o={schema_version:2,status:"delivered",type:j.type??"agent-turn-complete",thread_id:j["thread-id"]??j.thread_id??"",turn_id:j["turn-id"]??j.turn_id??"",cwd:j.cwd??"",client:j.client??"",mode,pane,title,report,evidence,evidence_present:fs.existsSync(evidence)&&fs.statSync(evidence).size>0,completed_at:new Date().toISOString()};process.stdout.write(JSON.stringify(o,null,2)+"\n")' \
+                "$src" "$mode" "$pane" "$title" "$report" "$evidence" > "$tmp"
+            ;;
+        python3)
+            python3 -c 'import json,sys,os,datetime; src,mode,pane,title,report,evidence=sys.argv[1:]; j=json.load(open(src)); o={"schema_version":2,"status":"delivered","type":j.get("type","agent-turn-complete"),"thread_id":j.get("thread-id") or j.get("thread_id") or "","turn_id":j.get("turn-id") or j.get("turn_id") or "","cwd":j.get("cwd", ""),"client":j.get("client", ""),"mode":mode,"pane":pane,"title":title,"report":report,"evidence":evidence,"evidence_present":os.path.exists(evidence) and os.path.getsize(evidence)>0,"completed_at":datetime.datetime.now(datetime.timezone.utc).isoformat()}; print(json.dumps(o,ensure_ascii=False,indent=2))' \
+                "$src" "$mode" "$pane" "$title" "$report" "$evidence" > "$tmp"
+            ;;
+        jq)
+            jq --arg mode "$mode" --arg pane "$pane" --arg title "$title" --arg report "$report" \
+               --arg evidence "$evidence" --argjson evidence_present "$([ -s "$evidence" ] && echo true || echo false)" \
+               '{schema_version:2,status:"delivered",type:(.type//"agent-turn-complete"),thread_id:(."thread-id"//.thread_id//""),turn_id:(."turn-id"//.turn_id//""),cwd:(.cwd//""),client:(.client//""),mode:$mode,pane:$pane,title:$title,report:$report,evidence:$evidence,evidence_present:$evidence_present,completed_at:(now|todateiso8601)}' \
+               "$src" > "$tmp"
+            ;;
+    esac || { rm -f -- "$tmp"; return 1; }
+    chmod 600 "$tmp" 2>/dev/null || true
+    mv -f -- "$tmp" "$dest"
+}
+
+json_make_exec_notify() {
+    local events="$1" last="$2" cwd="$3" dest="$4" tmp="${4}.tmp.$$"; choose_json_engine || return 1
+    case "$JSON_ENGINE" in
+        node)
+            node -e 'const fs=require("fs");const [events,last,cwd]=process.argv.slice(1);let tid="";for(const line of fs.readFileSync(events,"utf8").split(/\n/)){if(!line)continue;try{const j=JSON.parse(line);if(j.type==="thread.started")tid=j.thread_id??j.threadId??tid}catch{}}const msg=fs.existsSync(last)?fs.readFileSync(last,"utf8"):"";process.stdout.write(JSON.stringify({type:"agent-turn-complete","thread-id":tid,"turn-id":"",cwd,client:"codex-exec","input-messages":[],"last-assistant-message":msg})+"\n")' \
+                "$events" "$last" "$cwd" > "$tmp"
+            ;;
+        python3)
+            python3 -c 'import json,sys,os; events,last,cwd=sys.argv[1:]; tid="";
+for line in open(events,errors="replace"):
+  try:
+    j=json.loads(line)
+    if j.get("type")=="thread.started": tid=j.get("thread_id") or j.get("threadId") or tid
+  except Exception: pass
+msg=open(last,errors="replace").read() if os.path.exists(last) else ""; print(json.dumps({"type":"agent-turn-complete","thread-id":tid,"turn-id":"","cwd":cwd,"client":"codex-exec","input-messages":[],"last-assistant-message":msg},ensure_ascii=False))' \
+                "$events" "$last" "$cwd" > "$tmp"
+            ;;
+        jq)
+            local tid msg_json
+            tid=$(jq -r 'select(.type=="thread.started") | .thread_id // .threadId // empty' "$events" 2>/dev/null | tail -1)
+            msg_json=$(jq -Rs . < "$last")
+            jq -n --arg tid "$tid" --arg cwd "$cwd" --argjson msg "$msg_json" \
+                '{type:"agent-turn-complete","thread-id":$tid,"turn-id":"",cwd:$cwd,client:"codex-exec","input-messages":[],"last-assistant-message":$msg}' > "$tmp"
+            ;;
+    esac || { rm -f -- "$tmp"; return 1; }
+    chmod 600 "$tmp" 2>/dev/null || true
+    mv -f -- "$tmp" "$dest"
+}
+
+append_footer() {
+    local report="$1" json="$2" meta="$3" pane="$4" mode="$5" thread cwd
+    grep -q '^\[codex-tmux\] session-id:' "$report" 2>/dev/null && return 0
+    thread=$(json_scalar "$json" thread-id) || thread=""
+    cwd=$(json_scalar "$json" cwd) || cwd=""
+    {
+        printf '\n---\n[codex-tmux] delivered %s mode=%s pane=%s\n' "$(date '+%F %T')" "$mode" "${pane:--}"
+        [ -n "$thread" ] && printf '[codex-tmux] session-id: %s\n' "$thread"
+        [ -n "$cwd" ] && printf '[codex-tmux] cwd: %s\n' "$cwd"
+        printf '[codex-tmux] meta: %s\n' "$meta"
+    } >> "$report"
+}
+
+finalize_payload() {
+    local report="$1" json="$2" mode="$3" pane="$4" title="$5" fallback="$6"
+    local last="$report.last.md" meta="$report.meta.json" evidence thread cwd tmp
+    evidence=$(derive_evidence "$report")
+    json_extract_last "$json" "$last" || return 1
+
+    if [ ! -s "$report" ]; then
+        [ "$fallback" = 1 ] || return 3
+        tmp="${report}.tmp.$$"
+        if [ -s "$last" ]; then cp -- "$last" "$tmp"; else printf '(Codex 未返回最终消息，原始事件见 %s)\n' "$json" > "$tmp"; fi
+        mv -f -- "$tmp" "$report"
+    fi
+
+    json_write_meta "$json" "$meta" "$mode" "$pane" "$title" "$report" "$evidence" || return 1
+    append_footer "$report" "$json" "$meta" "$pane" "$mode" || return 1
+    thread=$(json_scalar "$json" thread-id) || thread=""
+    cwd=$(json_scalar "$json" cwd) || cwd=""
+    session_update "$thread" "$cwd" "$report" "$mode" || return 1
+    if [ -s "$evidence" ]; then write_state "$report" delivered "thread=$thread"
+    else write_state "$report" delivered "thread=$thread evidence-missing=$evidence"; fi
+}
+
+# ---------- hidden notify entrypoint; payload comes from stdin, not a second argv ----------
+internal_notify() {
+    local report="" title="" mode="pane" workdir="" require_report=1 close_pane=0 pane="${TMUX_PANE:-}"
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --report) report="${2-}"; shift 2 ;;
+            --title) title="${2-}"; shift 2 ;;
+            --mode) mode="${2-}"; shift 2 ;;
+            --workdir) workdir="${2-}"; shift 2 ;;
+            --require-report) require_report="${2-}"; shift 2 ;;
+            --close) close_pane="${2-}"; shift 2 ;;
+            *) echo "codex-tmux __notify: unknown $1" >&2; return 2 ;;
+        esac
+    done
+    [ -n "$report" ] || return 2
+    mkdir -p -- "$(dirname "$report")" || return 2
+    umask 077
+
+    local latest="$report.latest.notify.json" latest_last="$report.latest.md"
+    local canonical="$report.notify.json" claim="$report.claim" err="$report.notify.error"
+    if ! atomic_write "$latest"; then write_state "$report" failed "notify-write"; return 2; fi
+    if ! json_valid "$latest"; then
+        printf 'invalid notify JSON at %s\n' "$(date '+%F %T')" | atomic_write "$err"
+        write_state "$report" failed "invalid-notify-json"
+        return 2
+    fi
+    json_extract_last "$latest" "$latest_last" || true
+
+    if [ -d "$claim" ]; then return 0; fi       # 已交付后的手工 follow-up 只更新 latest sidecars
+    if [ "$require_report" = 1 ] && [ ! -s "$report" ]; then
+        write_state "$report" needs-input "report-missing; latest=$latest_last"
+        return 0
+    fi
+    if ! mkdir "$claim" 2>/dev/null; then return 0; fi
+
+    if ! atomic_copy "$latest" "$canonical" || ! finalize_payload "$report" "$canonical" "$mode" "$pane" "$title" "$((1-require_report))"; then
+        printf 'finalize failed at %s\n' "$(date '+%F %T')" | atomic_write "$err"
+        write_state "$report" failed "finalize"
+        rmdir "$claim" 2>/dev/null || true
+        return 2
+    fi
+    atomic_touch "$report.done" || { write_state "$report" failed "done-write"; return 2; }
+    rmdir "$report.run" 2>/dev/null || true
+
+    if [ -n "$pane" ] && command -v tmux >/dev/null 2>&1; then
+        tmux capture-pane -p -S - -t "$pane" > "$report.pane.log" 2>/dev/null || true
+        chmod 600 "$report.pane.log" 2>/dev/null || true
+        tmux select-pane -t "$pane" -T "cx:$title ✅" 2>/dev/null || true
+        tmux set-option -p -t "$pane" remain-on-exit off 2>/dev/null || true
+        if [ "$close_pane" = 1 ]; then
+            (sleep 0.2; tmux kill-pane -t "$pane" 2>/dev/null || true) &
+        fi
+    fi
+}
+
+# ---------- resume metadata ----------
+rollout_for_resume() {
+    local id="$1" sessdir="${CODEX_HOME:-$HOME/.codex}/sessions" line
+    [ -d "$sessdir" ] || return 1
+    if [ "$id" = last ]; then
+        line=$(find "$sessdir" -type f -name 'rollout-*.jsonl' -printf '%T@\t%p\n' 2>/dev/null | sort -nr | head -1)
+    else
+        line=$(find "$sessdir" -type f -name "rollout-*${id}*.jsonl" -printf '%T@\t%p\n' 2>/dev/null | sort -nr | head -1)
+    fi
+    printf '%s' "${line#*$'\t'}"
+}
+
+rollout_cwd() {
+    grep -o '"cwd":"[^"]*"' "$1" 2>/dev/null | tail -1 | sed 's/^"cwd":"//;s/"$//'
+}
+
+rollout_id() {
+    local b; b=$(basename "$1" .jsonl); printf '%s' "${b: -36}"
+}
+
+resolve_resume() { # mutates resume_id/workdir/workdir_set
+    local row="" sid="" cwd="" rep="" epoch="" smode="" rollout=""
+    if [ "$resume_id" = last ]; then row=$(session_last) || true; else row=$(session_lookup "$resume_id") || true; fi
+    if [ -n "$row" ]; then
+        IFS=$'\t' read -r sid cwd rep epoch smode <<< "$row"
+        resume_id="$sid"
+        if [ "$workdir_set" = 0 ] && [ -n "$cwd" ] && [ -d "$cwd" ]; then workdir="$cwd"; workdir_set=1; fi
+        return 0
+    fi
+
+    rollout=$(rollout_for_resume "$resume_id") || rollout=""
+    [ -n "$rollout" ] || return 1
+    [ "$resume_id" = last ] && resume_id=$(rollout_id "$rollout")
+    cwd=$(rollout_cwd "$rollout") || cwd=""
+    if [ "$workdir_set" = 0 ] && [ -n "$cwd" ] && [ -d "$cwd" ]; then workdir="$cwd"; workdir_set=1; fi
+}
+
+# ---------- pane registry commands ----------
+state_label() {
+    case "$1" in
+        starting) echo 启动中 ;; running) echo 运行中 ;; needs-input) echo 待输入 ;;
+        detached) echo 后台运行 ;; delivered) echo 已交付 ;; failed) echo 失败 ;;
+        killed) echo 已关闭 ;; *) echo "$1" ;;
+    esac
 }
 
 cmd_list() {
-    reg_prune
-    [ -s "$REG" ] || { echo "(无登记的 codex 窗格)"; return 0; }
-    local pid t rep wd ts color st loc
+    local rows pid t rep wd ts color st loc thread
+    rows=$(reg_snapshot) || return 1
+    [ -n "$rows" ] || { echo "(无登记的 codex pane)"; return 0; }
     {
-        printf 'PANE\t任务\t状态\t位置\t启动\t终报\n'
+        printf 'PANE\t任务\t状态\t位置\t启动\tSESSION\t终报\n'
         while IFS=$'\t' read -r pid t rep wd ts color; do
-            st=运行中; [ -e "$rep.done" ] && st=完成
-            [ "$(tmux display-message -p -t "$pid" '#{pane_dead}' 2>/dev/null)" = 1 ] && st=死亡
+            [ -n "$pid" ] || continue
+            st=$(read_state "$rep")
+            [ -n "$st" ] || { [ -e "$rep.done" ] && st=delivered || st=running; }
+            if [ "$(tmux display-message -p -t "$pid" '#{pane_dead}' 2>/dev/null)" = 1 ] && [ "$st" != delivered ]; then st=failed; fi
             loc=$(tmux display-message -p -t "$pid" '#{session_name}:#{window_index}.#{pane_index}' 2>/dev/null) || loc='?'
-            printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$pid" "$t" "$st" "$loc" "$ts" "$rep"
-        done < "$REG"
+            thread=""; [ -s "$rep.meta.json" ] && thread=$(json_scalar "$rep.meta.json" thread_id 2>/dev/null) || true
+            printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$pid" "$t" "$(state_label "$st")" "$loc" "$ts" "${thread:0:8}" "$rep"
+        done <<< "$rows"
     } | { column -t -s "$(printf '\t')" 2>/dev/null || cat; }
 }
 
 cmd_kill() {
-    local sel="${1:-}"
+    local sel="${1:-}" rows pid t rep wd ts color win n=0 h st
+    local -a hits=() wins=()
     [ -n "$sel" ] || { echo "用法: codex-tmux kill <任务名|%pane_id|done|all>" >&2; return 2; }
     sel="${sel#cx:}"
-    reg_prune
-    [ -s "$REG" ] || { echo "(无登记的 codex 窗格)"; return 1; }
-    local pid t rep wd ts color win="" n=0 h
-    local -a hits=()
+    rows=$(reg_snapshot) || return 1
+    [ -n "$rows" ] || { echo "(无登记的 codex pane)"; return 1; }
     while IFS=$'\t' read -r pid t rep wd ts color; do
+        st=$(read_state "$rep"); [ -n "$st" ] || { [ -e "$rep.done" ] && st=delivered || st=running; }
         case "$sel" in
-            all)  hits+=("$pid $t") ;;
-            done) [ -e "$rep.done" ] && hits+=("$pid $t") ;;
-            *)    if [ "$sel" = "$pid" ] || [ "$sel" = "$t" ]; then hits+=("$pid $t"); fi ;;
+            all) hits+=("$pid"$'\t'"$t"$'\t'"$rep") ;;
+            done) [ "$st" = delivered ] && hits+=("$pid"$'\t'"$t"$'\t'"$rep") ;;
+            *) if [ "$sel" = "$pid" ] || [ "$sel" = "$t" ]; then hits+=("$pid"$'\t'"$t"$'\t'"$rep"); fi ;;
         esac
-    done < "$REG"
-    ((${#hits[@]})) || { echo "codex-tmux: 没有匹配 '$sel' 的窗格(codex-tmux list 查看)" >&2; return 1; }
+    done <<< "$rows"
+    ((${#hits[@]})) || { echo "codex-tmux: 没有匹配 '$sel' 的 pane" >&2; return 1; }
     if [ "$sel" != all ] && [ "$sel" != done ] && [ ${#hits[@]} -gt 1 ]; then
-        echo "codex-tmux: '$sel' 命中多个,请改用 %pane_id:" >&2
-        printf '  %s\n' "${hits[@]}" >&2; return 3
+        echo "codex-tmux: '$sel' 命中多个，请改用 %pane_id" >&2; return 3
     fi
     for h in "${hits[@]}"; do
-        pid="${h%% *}"
+        IFS=$'\t' read -r pid t rep <<< "$h"
         win=$(tmux display-message -p -t "$pid" '#{session_name}:#{window_index}' 2>/dev/null) || win=""
-        tmux kill-pane -t "$pid" 2>/dev/null && { echo "已关闭 $h"; n=$((n+1)); }
+        [ -n "$win" ] && wins+=("$win")
+        if tmux kill-pane -t "$pid" 2>/dev/null; then
+            st=$(read_state "$rep"); [ "$st" = delivered ] || write_state "$rep" killed "pane=$pid"
+            rmdir "$rep.run" 2>/dev/null || true
+            echo "已关闭 $pid $t"; n=$((n+1))
+        fi
     done
     reg_prune
-    [ -n "$win" ] && rebalance "$win"
+    for win in "${wins[@]}"; do rebalance "$win"; done
     [ "$n" -gt 0 ]
 }
 
+registered_panes_in_window() {
+    local win="$1" rows pid t rep wd ts color pwin
+    rows=$(reg_snapshot) || return 1
+    while IFS=$'\t' read -r pid t rep wd ts color; do
+        [ -n "$pid" ] || continue
+        pwin=$(tmux display-message -p -t "$pid" '#{session_name}:#{window_index}' 2>/dev/null) || continue
+        [ "$pwin" = "$win" ] && printf '%s\n' "$pid"
+    done <<< "$rows"
+}
+
+rebalance() {
+    local win="$1" p main="" n
+    local -a all=() cx=()
+    [ "${CODEX_TMUX_LAYOUT:-main-vertical}" = none ] && return 0
+    mapfile -t all < <(tmux list-panes -t "$win" -F '#{pane_id}' 2>/dev/null)
+    mapfile -t cx < <(registered_panes_in_window "$win")
+    n=${#all[@]}
+    [ "$n" -gt 2 ] || return 0
+    [ "$n" -eq $(( ${#cx[@]} + 1 )) ] || return 0 # 有 Claude/其他 pane 时不重排整个 window
+    for p in "${all[@]}"; do
+        if ! printf '%s\n' "${cx[@]}" | grep -qxF "$p"; then main="$p"; break; fi
+    done
+    [ -n "$main" ] || return 0
+    tmux select-layout -t "$win" main-vertical 2>/dev/null || true
+    tmux resize-pane -t "$main" -x "${CODEX_TMUX_MAIN_WIDTH:-30%}" 2>/dev/null || true
+}
+
 case "${1:-}" in
-    list|ls)       shift; cmd_list "$@"; exit $? ;;
+    __notify) shift; internal_notify "$@"; exit $? ;;
+    list|ls) shift; cmd_list "$@"; exit $? ;;
     kill|close|rm) shift; cmd_kill "$@"; exit $? ;;
 esac
 
-# ============ 派发参数解析 ============
-title="" report="" workdir="$PWD" workdir_set=0 brief="" resume_id="" mode="${CODEX_TMUX_MODE:-pane}"
-close_pane=0 timeout=0
+# ---------- dispatch argument parsing ----------
+title="" report="" workdir="$PWD" workdir_set=0 brief_src="" resume_id=""
+mode="${CODEX_TMUX_MODE:-pane}" close_pane=0 timeout="${CODEX_TMUX_TIMEOUT:-0}"
+require_report="${CODEX_TMUX_REQUIRE_REPORT:-1}"
 while [ $# -gt 0 ]; do
     case "$1" in
-        -t) title="$2"; shift 2 ;;
-        -o) report="$2"; shift 2 ;;
-        -C) workdir="$2"; workdir_set=1; shift 2 ;;
-        --brief) brief="$2"; shift 2 ;;
-        --resume) resume_id="$2"; shift 2 ;;
+        -t) [ $# -ge 2 ] || die "-t 缺少值"; title="$2"; shift 2 ;;
+        -o) [ $# -ge 2 ] || die "-o 缺少值"; report="$2"; shift 2 ;;
+        -C) [ $# -ge 2 ] || die "-C 缺少值"; workdir="$2"; workdir_set=1; shift 2 ;;
+        --brief) [ $# -ge 2 ] || die "--brief 缺少值"; brief_src="$2"; shift 2 ;;
+        --resume) [ $# -ge 2 ] || die "--resume 缺少值"; resume_id="$2"; shift 2 ;;
         -w|--window) mode=window; shift ;;
         --close) close_pane=1; shift ;;
-        --timeout) timeout="$2"; shift 2 ;;
+        --timeout) [ $# -ge 2 ] || die "--timeout 缺少值"; timeout="$2"; shift 2 ;;
+        --allow-last-message) require_report=0; shift ;;
         --) shift; break ;;
-        -h|--help) sed -n '2,44p' "$0"; exit 0 ;;
-        *) echo "codex-tmux: 未知参数 $1(codex 旗标请放 -- 之后)" >&2; exit 2 ;;
+        -h|--help) usage; exit 0 ;;
+        *) die "未知参数 $1（Codex flags 请放在 -- 之后）" ;;
     esac
 done
 extra=("$@")
-[ -n "$report" ] || { echo "codex-tmux: 缺少 -o <终报路径>" >&2; exit 2; }
 
-report=$(realpath -m -- "$report"); mkdir -p "$(dirname "$report")"
+[ -n "$report" ] || die "缺少 -o REPORT"
+case "$mode" in pane|window|exec) ;; *) die "CODEX_TMUX_MODE 必须是 pane、window 或 exec" ;; esac
+[[ "$timeout" =~ ^[0-9]+$ ]] || die "--timeout 必须是非负整数秒"
+case "$require_report" in 0|1) ;; *) die "CODEX_TMUX_REQUIRE_REPORT 必须是 0 或 1" ;; esac
+case "${CODEX_TMUX_BYPASS:-1}" in 0|1) ;; *) die "CODEX_TMUX_BYPASS 必须是 0 或 1" ;; esac
+tsv_safe "$title" || die "任务标题不能包含 tab/newline"
+tsv_safe "$report" || die "报告路径不能包含 tab/newline"
+tsv_safe "$workdir" || die "工作目录不能包含 tab/newline"
 
-# resume 且未显式 -C:从 rollout 反查会话最后记录的 cwd 并显式采用。codex 会拿进程当前
-# 目录与会话记录比对,不一致就弹交互式目录选择器,无人值守窗格会永久卡住(2026-07-18 实证)。
-# 反查失败则退回旧行为(不传 -C,可能弹选择器,需人工/send-keys 处理)。
-if [ -n "$resume_id" ] && [ "$workdir_set" = 0 ]; then
-    _sessdir="${CODEX_HOME:-$HOME/.codex}/sessions"
-    if [ "$resume_id" = last ]; then
-        _rollout=$(ls -t "$_sessdir"/*/*/*/rollout-*.jsonl 2>/dev/null | head -1)
-    else
-        _rollout=$(ls -t "$_sessdir"/*/*/*/rollout-*"$resume_id"*.jsonl 2>/dev/null | head -1)
-    fi
-    if [ -n "$_rollout" ]; then
-        _sess_cwd=$(grep -o '"cwd":"[^"]*"' "$_rollout" | tail -1 | sed 's/^"cwd":"//;s/"$//')
-        if [ -n "$_sess_cwd" ] && [ -d "$_sess_cwd" ]; then
-            workdir="$_sess_cwd"; workdir_set=1
-        else
-            echo "codex-tmux: 警告:resume 会话 cwd 反查失败,可能弹目录选择器" >&2
-        fi
-    else
-        echo "codex-tmux: 警告:未找到 resume 会话 rollout,可能弹目录选择器" >&2
-    fi
-fi
+for f in "${extra[@]}"; do
+    case "$f" in
+        -o|--output-last-message|--json|--ephemeral|-C|--cd|--last|--include-non-interactive)
+            die "Codex flag '$f' 由 codex-tmux 管理，不能重复传入" ;;
+    esac
+done
 
-workdir=$(realpath -m -- "$workdir")
+command -v codex >/dev/null 2>&1 || die "未找到 codex CLI"
+choose_json_engine || die "需要 node、python3 或 jq 之一处理结构化结果"
+
+report=$(realpath -m -- "$report")
+mkdir -p -- "$(dirname "$report")" || die "无法创建报告目录"
 [ -n "$title" ] || { title=$(basename "$report"); title="${title%%.*}"; }
+tsv_safe "$title" || die "任务标题不能包含 tab/newline"
 
-# 简报:--brief 或 stdin
-if [ -n "$brief" ]; then
-    brief=$(realpath -m -- "$brief")
-else
-    brief="$report.brief"; cat > "$brief"
-fi
-[ -s "$brief" ] || { echo "codex-tmux: 简报为空(--brief 文件或 stdin)" >&2; exit 2; }
-
-bypassflag=()
-[ "${CODEX_TMUX_BYPASS:-1}" = 1 ] && bypassflag=(--dangerously-bypass-approvals-and-sandbox)
-
-json="$report.notify.json"; donef="$report.done"
-notify_sh="$report.notify.sh"; launch_sh="$report.launch.sh"
-panelog="$report.pane.log"; stamp="$report.stamp"
-rm -f "$json" "$donef"; touch "$stamp"
-
-# ---------- 找 tmux;找不到则降级 exec ----------
 target=""
 if [ "$mode" != exec ]; then
     if [ -n "${TMUX:-}" ]; then
         target="${TMUX_PANE:-}"
     elif command -v tmux >/dev/null 2>&1; then
-        target=$(tmux list-sessions -F '#{session_attached} #{session_name}' 2>/dev/null \
-                 | awk '$1>=1{print $2":"; exit}')
+        target=$(tmux list-sessions -F '#{session_attached} #{session_name}' 2>/dev/null | awk '$1>=1{print $2":"; exit}')
         [ -n "$target" ] || mode=exec
     else
         mode=exec
     fi
 fi
 
-if [ "$mode" = exec ]; then   # —— 黑盒降级:行为同原始 codex exec 用法 ——
-    if [ -n "$resume_id" ]; then
-        rargs=(); [ "$resume_id" = last ] && rargs=(--last) || rargs=("$resume_id")
-        codex exec resume "${bypassflag[@]}" --skip-git-repo-check \
-            "${extra[@]}" -o "$report" "${rargs[@]}" - < "$brief" > "$panelog" 2>&1
-    else
-        codex exec "${bypassflag[@]}" --skip-git-repo-check \
-            -C "$workdir" "${extra[@]}" -o "$report" - < "$brief" > "$panelog" 2>&1
-    fi
-    ec=$?; echo "[codex-tmux] exec 降级模式 exit=$ec 终报=$report 日志=$panelog"; exit "$ec"
+if [ -n "$resume_id" ]; then
+    resolve_resume || { [ "$resume_id" = last ] && die "无法解析 last 会话；请传明确 session-id" || true; }
+fi
+if [ "$workdir_set" = 1 ]; then
+    [ -d "$workdir" ] || die "工作目录不存在: $workdir"
+    workdir=$(realpath -m -- "$workdir")
+elif [ -z "$resume_id" ]; then
+    workdir=$(realpath -m -- "$workdir")
+fi
+if [ -n "$resume_id" ] && [ "$mode" != exec ] && [ "$workdir_set" = 0 ]; then
+    die "无法恢复 resume 会话 cwd；为避免交互式目录选择器，请显式传 -C"
 fi
 
-# ---------- 生成 notify 回调脚本(codex 官方接口:turn 完成时携 JSON 调用) ----------
-{
-    printf '#!/usr/bin/env bash\n'
-    printf 'printf %%s "$1" > %q && mv -f %q %q\n' "$json.tmp" "$json.tmp" "$json"
-    printf ': > %q\n' "$donef"
-} > "$notify_sh"; chmod +x "$notify_sh"
+if report_in_use "$report"; then die "报告路径正在被另一个 pane 使用: $report"; fi
+[ ! -d "$report.run" ] || die "报告路径已有活动 run lock: $report.run"
 
-# ---------- 生成窗格启动脚本:真 codex TUI + 简报作为首条 prompt ----------
-tuiflags=()
-for f in "${extra[@]}"; do [ "$f" = --skip-git-repo-check ] || tuiflags+=("$f"); done
-{
-    printf '#!/usr/bin/env bash\n'
-    printf 'exec codex'
-    [ -n "$resume_id" ] && printf ' resume'
-    ((${#bypassflag[@]})) && printf ' %q' "${bypassflag[@]}"
-    # resume 时 workdir 已在参数解析后由 rollout 反查回填(workdir_set=1);仅当反查
-    # 失败才落到不传 -C 的旧行为(codex 可能弹目录选择器)。
-    if [ -z "$resume_id" ] || [ "$workdir_set" = 1 ]; then
-        printf ' -C %q' "$workdir"
-        printf ' -c %q' "projects.\"$workdir\".trust_level=\"trusted\""
+evidence=$(derive_evidence "$report")
+if [ -n "$brief_src" ]; then
+    brief_src=$(realpath -m -- "$brief_src")
+    [ -s "$brief_src" ] || die "简报为空或不存在: $brief_src"
+fi
+rmdir "$report.claim" 2>/dev/null || true
+rm -f -- "$report" "$evidence" "$report.done" "$report.notify.json" "$report.latest.notify.json" \
+    "$report.last.md" "$report.latest.md" "$report.meta.json" "$report.state" "$report.notify.error" \
+    "$report.pane.log" "$report.events.jsonl" "$report.launch.sh" "$report.notify.sh" "$report.stamp" \
+    "$report.gate"
+[ "$brief_src" = "$report.brief" ] 2>/dev/null || rm -f -- "$report.brief"
+mkdir "$report.run" || die "无法建立 run lock: $report.run"
+chmod 700 "$report.run" 2>/dev/null || true
+write_state "$report" starting "mode=$mode"
+atomic_touch "$report.stamp"
+
+brief="$report.brief"
+if [ -n "$brief_src" ]; then
+    if [ "$brief_src" != "$brief" ]; then
+        atomic_copy "$brief_src" "$brief" || { rmdir "$report.run"; die "无法复制简报"; }
     fi
-    ((${#tuiflags[@]})) && printf ' %q' "${tuiflags[@]}"
-    printf ' -c %q' "notify=[\"$notify_sh\"]"
-    [ "$resume_id" = last ] && printf ' --last'
-    printf ' --'
-    [ -n "$resume_id" ] && [ "$resume_id" != last ] && printf ' %q' "$resume_id"
-    printf ' "$(cat %q)"\n' "$brief"
-} > "$launch_sh"; chmod +x "$launch_sh"
+else
+    atomic_write "$brief" || { rmdir "$report.run"; die "无法从 stdin 写入简报"; }
+fi
+[ -s "$brief" ] || { rmdir "$report.run"; die "简报为空"; }
 
-# ---------- 开窗格(agent-team 同款:首个 -h 定宽,后续取 cx 区中位窗格奇偶交替切) ----------
-pane_id="" win=""
-panecmd="exec bash $launch_sh"
+bypassflag=()
+if [ "${CODEX_TMUX_BYPASS:-1}" = 1 ]; then
+    bypassflag=(--dangerously-bypass-approvals-and-sandbox)
+    if codex --help 2>&1 | grep -q -- '--dangerously-bypass-hook-trust'; then
+        bypassflag+=(--dangerously-bypass-hook-trust)
+    fi
+fi
+
+panelog="$report.pane.log" events="$report.events.jsonl" canonical="$report.notify.json"
+last_tmp="$report.last.codex.tmp.$$"
+
+# ---------- headless fallback ----------
+if [ "$mode" = exec ]; then
+    write_state "$report" running "mode=exec"
+    cmd=(codex exec)
+    [ -n "$resume_id" ] && cmd+=(resume)
+    cmd+=("${bypassflag[@]}" --skip-git-repo-check)
+    [ -z "$resume_id" ] && cmd+=(-C "$workdir")
+    cmd+=("${extra[@]}" --json -o "$last_tmp")
+    [ -n "$resume_id" ] && cmd+=("$resume_id")
+    cmd+=(-)
+    "${cmd[@]}" < "$brief" > "$events" 2> "$panelog"
+    ec=$?
+    if [ "$ec" -ne 0 ]; then
+        [ -s "$last_tmp" ] && mv -f -- "$last_tmp" "$report.last.md" || true
+        write_state "$report" failed "exec=$ec"
+        rmdir "$report.run" 2>/dev/null || true
+        echo "[codex-tmux] exec 失败 exit=$ec 日志=$panelog" >&2
+        exit "$ec"
+    fi
+    json_make_exec_notify "$events" "$last_tmp" "$workdir" "$canonical" || {
+        write_state "$report" failed "exec-notify"; rmdir "$report.run" 2>/dev/null || true; exit 2;
+    }
+    finalize_payload "$report" "$canonical" exec "" "$title" 1 || {
+        write_state "$report" failed "exec-finalize"; rmdir "$report.run" 2>/dev/null || true; exit 2;
+    }
+    atomic_touch "$report.done"
+    rm -f -- "$last_tmp"
+    rmdir "$report.run" 2>/dev/null || true
+    sid=$(json_scalar "$canonical" thread-id) || sid=""
+    echo "[codex-tmux] exec 已交付 report=$report session=$sid"
+    exit 0
+fi
+
+# ---------- TUI notify/launch scripts ----------
+notify_sh="$report.notify.sh" launch_sh="$report.launch.sh" gate="$report.gate"
+{
+    printf '#!/usr/bin/env bash\nset -u\n'
+    printf 'export CODEX_TMUX_CACHE_DIR=%q\n' "$REG_DIR"
+    printf 'printf %%s "${1:-}" | exec bash %q __notify --report %q --title %q --mode %q --workdir %q --require-report %q --close %q\n' \
+        "$SELF" "$report" "$title" "$mode" "$workdir" "$require_report" "$close_pane"
+} > "$notify_sh"
+chmod 700 "$notify_sh"
+
+toml_workdir=${workdir//\\/\\\\}; toml_workdir=${toml_workdir//\"/\\\"}
+toml_notify=${notify_sh//\\/\\\\}; toml_notify=${toml_notify//\"/\\\"}
+bootstrap="Read the complete task brief at: $brief
+Execute it as the user's full instructions. Progress is visible in this pane. Only when the task is actually complete, write the final summary to: $report
+Write detailed evidence to: $evidence
+Do not create the summary merely to ask a clarification question; ask in this pane and wait instead."
+
+codex_cmd=(codex)
+[ -n "$resume_id" ] && codex_cmd+=(resume)
+codex_cmd+=("${bypassflag[@]}" -C "$workdir" -c "projects.\"$toml_workdir\".trust_level=\"trusted\"")
+codex_cmd+=("${extra[@]}" -c "notify=[\"$toml_notify\"]" --)
+[ -n "$resume_id" ] && codex_cmd+=("$resume_id")
+codex_cmd+=("$bootstrap")
+{
+    printf '#!/usr/bin/env bash\nset -u\n'
+    printf 'for _cx_i in {1..200}; do [ -e %q ] && break; sleep 0.05; done\n' "$gate"
+    printf 'exec'
+    printf ' %q' "${codex_cmd[@]}"
+    printf '\n'
+} > "$launch_sh"
+chmod 700 "$launch_sh"
+
+pane_id="" win="" color="" started=$(date '+%F %T')
+printf -v panecmd 'exec bash %q' "$launch_sh"
 if [ "$mode" = pane ]; then
-    win=$(tmux display-message -p ${target:+-t "$target"} '#{session_name}:#{window_index}' 2>/dev/null) || win=""
-    mapfile -t allp < <(tmux list-panes ${win:+-t "$win"} -F '#{pane_id}' 2>/dev/null)
-    if [ ${#allp[@]} -le 1 ]; then
-        pane_id=$(tmux split-window -d ${target:+-t "$target"} -h -l "${CODEX_TMUX_PANE_WIDTH:-70%}" \
-                  -P -F '#{pane_id}' -- "$panecmd" 2>/dev/null) || pane_id=""
+    if [ -n "$target" ]; then win=$(tmux display-message -p -t "$target" '#{session_name}:#{window_index}' 2>/dev/null) || win=""
+    else win=$(tmux display-message -p '#{session_name}:#{window_index}' 2>/dev/null) || win=""; fi
+    mapfile -t cxp < <(registered_panes_in_window "$win")
+    if [ ${#cxp[@]} -eq 0 ]; then
+        split_target="$target"
+        [ -n "$split_target" ] || split_target="$win"
+        pane_id=$(tmux split-window -d -t "$split_target" -h -l "${CODEX_TMUX_PANE_WIDTH:-70%}" -P -F '#{pane_id}' -- "$panecmd" 2>/dev/null) || pane_id=""
     else
-        tm=("${allp[@]:1}"); c=${#tm[@]}
-        p="${tm[$(( (c - 1) / 2 ))]:-${allp[-1]}}"
-        dir=-h; [ $((c % 2)) = 1 ] && dir=-v
+        c=${#cxp[@]}; p="${cxp[$(( (c - 1) / 2 ))]}"; dir=-h; [ $((c % 2)) = 1 ] && dir=-v
         pane_id=$(tmux split-window -d -t "$p" "$dir" -P -F '#{pane_id}' -- "$panecmd" 2>/dev/null) || pane_id=""
     fi
 fi
-if [ -z "$pane_id" ]; then   # 显式 -w,或分屏没空间 → 独立窗口
-    pane_id=$(tmux new-window -d -n "cx:$title" -P -F '#{pane_id}' \
-              ${target:+-t "$target"} -- "$panecmd" 2>/dev/null) || pane_id=""
+if [ -z "$pane_id" ]; then
+    if [ -n "$target" ]; then pane_id=$(tmux new-window -d -t "$target" -n "cx:$title" -P -F '#{pane_id}' -- "$panecmd" 2>/dev/null) || pane_id=""
+    else pane_id=$(tmux new-window -d -n "cx:$title" -P -F '#{pane_id}' -- "$panecmd" 2>/dev/null) || pane_id=""; fi
+    mode=window
 fi
-[ -n "$pane_id" ] || { echo "codex-tmux: 开 tmux 窗格失败" >&2; exit 2; }
+if [ -z "$pane_id" ]; then
+    write_state "$report" failed "tmux-launch"
+    rmdir "$report.run" 2>/dev/null || true
+    die "无法创建 tmux pane/window"
+fi
 
-# 样式 + 登记(agent-team setPaneBorderColor/setPaneTitle/taskRegistry 同款)
-reg_prune; mkdir -p "$REG_DIR"
-ncx=0; [ -s "$REG" ] && ncx=$(grep -c . "$REG")
+# split 失败转 window 后，回调必须记录最终 mode；gate 尚未打开，覆盖是安全的。
+{
+    printf '#!/usr/bin/env bash\nset -u\n'
+    printf 'export CODEX_TMUX_CACHE_DIR=%q\n' "$REG_DIR"
+    printf 'printf %%s "${1:-}" | exec bash %q __notify --report %q --title %q --mode %q --workdir %q --require-report %q --close %q\n' \
+        "$SELF" "$report" "$title" "$mode" "$workdir" "$require_report" "$close_pane"
+} > "$notify_sh"
+chmod 700 "$notify_sh"
+
+rows=$(reg_snapshot) || rows=""; ncx=0; [ -n "$rows" ] && ncx=$(printf '%s\n' "$rows" | grep -c .)
 color=${CX_COLORS[$(( ncx % ${#CX_COLORS[@]} ))]}
 tmux select-pane -t "$pane_id" -T "cx:$title" 2>/dev/null || true
 tmux set-option -p -t "$pane_id" pane-border-style "fg=$color" 2>/dev/null || true
@@ -271,77 +737,58 @@ tmux set-option -p -t "$pane_id" pane-border-format "#[fg=$color,bold] #{pane_ti
 tmux set-option -p -t "$pane_id" allow-set-title off 2>/dev/null || true
 tmux set-option -p -t "$pane_id" remain-on-exit on 2>/dev/null || true
 tmux set-option -w -t "$pane_id" pane-border-status top 2>/dev/null || true
+reg_add "$pane_id" "$title" "$report" "$workdir" "$started" "$color" || true
 [ "$mode" = pane ] && [ -n "$win" ] && rebalance "$win"
-printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$pane_id" "$title" "$report" "$workdir" "$(date '+%F %T')" "$color" >> "$REG"
+write_state "$report" running "pane=$pane_id mode=$mode"
+atomic_touch "$gate"
 echo "[codex-tmux] pane=$pane_id title=cx:$title color=$color 启动:$launch_sh"
 
-capture() { tmux capture-pane -p -S - -t "$pane_id" > "$panelog" 2>/dev/null || true; }
+capture() {
+    (umask 077; tmux capture-pane -p -S - -t "$pane_id" > "$panelog" 2>/dev/null) || true
+}
 
-# ---------- 等 notify 完成信号 ----------
-start=$SECONDS
-while [ ! -e "$donef" ]; do
+detached_by_signal=0
+on_detach_signal() {
+    detached_by_signal=1
+    write_state "$report" detached "signal; pane=$pane_id"
+    echo "codex-tmux: wrapper 收到信号，Codex 继续在 pane=$pane_id 运行；notify 仍会独立交付" >&2
+    exit 130
+}
+trap on_detach_signal INT TERM HUP
+
+start=$SECONDS last_seen_state=running
+while [ ! -e "$report.done" ]; do
+    st=$(read_state "$report")
+    if [ "$st" != "$last_seen_state" ]; then
+        echo "[codex-tmux] state=$st pane=$pane_id"
+        last_seen_state="$st"
+    fi
+    if [ "$st" = failed ]; then
+        capture
+        echo "codex-tmux: notify/finalize 失败，见 $report.notify.error 与 $panelog" >&2
+        exit 2
+    fi
     dead=$(tmux display-message -p -t "$pane_id" '#{pane_dead}' 2>/dev/null) || dead=gone
     if [ "$dead" = 1 ] || [ "$dead" = gone ]; then
-        sleep 1; [ -e "$donef" ] && break        # 竞态:退出前一刻刚好完成
+        sleep 1; [ -e "$report.done" ] && break
         capture
-        echo "codex-tmux: codex 窗格已死亡但任务未完成,现场见 $panelog(死窗格已保留)" >&2
+        write_state "$report" failed "pane-dead=$pane_id"
+        rmdir "$report.run" 2>/dev/null || true
+        echo "codex-tmux: Codex pane 已死亡但未交付，现场见 $panelog" >&2
         exit 2
     fi
     if [ "$timeout" -gt 0 ] && [ $((SECONDS - start)) -ge "$timeout" ]; then
         capture
-        echo "codex-tmux: 等待 ${timeout}s 超时,codex 仍在 pane=$pane_id 里跑;稍后自查 $json" >&2
+        write_state "$report" detached "timeout=${timeout}s pane=$pane_id"
+        echo "codex-tmux: 等待 ${timeout}s 超时；Codex 继续运行，notify 完成后会独立生成报告" >&2
         exit 124
     fi
     sleep 2
 done
-
-# ---------- 提取终报 + 反查 session-id ----------
-extract_last() {   # jq → node → python3,谁在用谁
-    if command -v jq >/dev/null 2>&1; then
-        jq -r '."last-assistant-message" // ."last_assistant_message" // empty' "$json" 2>/dev/null
-    elif command -v node >/dev/null 2>&1; then
-        node -e 'const j=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"));
-                 process.stdout.write(String(j["last-assistant-message"]??j["last_assistant_message"]??""))' \
-            "$json" 2>/dev/null
-    elif command -v python3 >/dev/null 2>&1; then
-        python3 -c 'import json,sys; j=json.load(open(sys.argv[1]));
-sys.stdout.write(str(j.get("last-assistant-message") or j.get("last_assistant_message") or ""))' \
-            "$json" 2>/dev/null
-    fi
-}
-last=$(extract_last) || last=""
-
-sid="" rollout=""
-sessdir="${CODEX_HOME:-$HOME/.codex}/sessions"
-mapfile -t newf < <(find "$sessdir" -type f -name 'rollout-*.jsonl' -newer "$stamp" 2>/dev/null)
-cand=()
-for f in "${newf[@]}"; do grep -m1 -qF "\"cwd\":\"$workdir\"" "$f" 2>/dev/null && cand+=("$f"); done
-((${#cand[@]})) || cand=("${newf[@]}")
-if [ ${#cand[@]} -gt 1 ]; then                    # 同 cwd 并发任务:再用简报特征行区分
-    key=$(grep -vE '["\\]' "$brief" | awk 'length(s)<length($0){s=$0} END{print s}' | cut -c1-120)
-    if [ -n "$key" ]; then
-        c2=(); for f in "${cand[@]}"; do grep -m1 -qF "$key" "$f" 2>/dev/null && c2+=("$f"); done
-        ((${#c2[@]})) && cand=("${c2[@]}")
-    fi
-fi
-if ((${#cand[@]})); then
-    rollout="${cand[0]}"; b=$(basename "$rollout" .jsonl); sid="${b: -36}"
-fi
-
-{
-    if [ -n "$last" ]; then printf '%s\n' "$last"
-    else printf '(notify 回调里没有 last-assistant-message,原始 JSON 见 %s)\n' "$json"; fi
-    printf '\n---\n[codex-tmux] 完成 %s  pane=%s\n' "$(date '+%F %T')" "$pane_id"
-    if [ -n "$sid" ]; then
-        printf '[codex-tmux] session-id: %s\n[codex-tmux] rollout: %s\n' "$sid" "$rollout"
-        [ ${#cand[@]} -gt 1 ] && printf '[codex-tmux] 注意:候选 session 有 %s 个,以上取第一个\n' "${#cand[@]}"
-        printf '[codex-tmux] 续聊: codex-tmux --resume %s -t %s -o <新终报> --brief <追问文件>\n' "$sid" "$title"
-    fi
-} > "$report"
+trap - INT TERM HUP
 
 capture
-tmux set-option -p -t "$pane_id" remain-on-exit off 2>/dev/null || true
-tmux select-pane -t "$pane_id" -T "cx:$title ✅" 2>/dev/null || true
-if [ "$close_pane" = 1 ]; then tmux kill-pane -t "$pane_id" 2>/dev/null; reg_prune; fi
-echo "[codex-tmux] 完成 终报=$report session=$sid pane=$pane_id(窗格保留可续聊;关闭=codex-tmux kill $title)"
+sid=$(json_scalar "$canonical" thread-id) || sid=""
+if [ "$close_pane" = 1 ]; then tmux kill-pane -t "$pane_id" 2>/dev/null || true; reg_prune || true; fi
+echo "[codex-tmux] 已交付 report=$report session=$sid pane=$pane_id"
 exit 0
