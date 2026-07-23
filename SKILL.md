@@ -76,7 +76,7 @@ tmux capture-pane -p -t <pane_id> | tail -8   # 验证到达,不许盲发即走
 
 codex TUI 的交互弹窗会让无人值守窗格永久卡住,进度停滞。分两道处理:
 
-- **脚本已内建(默认开,无需加参数)**:默认 bypass 姿态从根上关掉审批/信任类弹窗——启动命令带 `--dangerously-bypass-approvals-and-sandbox`,CLI 支持时(探测 `codex --help`)追加 `--dangerously-bypass-hook-trust`,并以 `-c 'projects."<workdir>".trust_level="trusted"'` 内联预信任兜底;不写 config.toml、无启动期抓屏看门狗(旧版机制,已被 bypass 根治取代)。`CODEX_TMUX_BYPASS=0` 走 codex 原生审批时弹窗会正常出现——窗格本来就是交互的,人工在窗格里作答或 `--timeout` 兜底。
+- **脚本已内建(默认开,无需加参数)**:bypass 姿态带 `--dangerously-bypass-approvals-and-sandbox`(+探测支持时 `--dangerously-bypass-hook-trust`)关审批/hook 类弹窗;**目录信任对话框需单独处理——0.140 实证(2026-07-23):信任检查只读 config.toml,内联 `-c projects."…".trust_level` 覆盖无效**,cwd 不在册即弹 "Do you trust the contents of this directory?" 永久卡死(历史上没炸只因 cwd 恰好都在早已入册的目录下;首个 `~/md1/...` 新目录即中招)。故脚本启动前把 workdir 信任条目**幂等写入 `~/.codex/config.toml`**(仅 bypass 姿态;mkdir 锁防并发重复表头;内联 `-c` 保留作前向兼容)。**启动进入看门狗**:spawn 后每轮核验"任务已真正进入执行"(TUI 活动样式或本次启动后记录该 workdir 的 rollout 落盘),未进入且屏上是已知阻塞样式(目录信任/`Press enter to continue`/resume 目录选择器)则自动 Enter(≤5 次,现场追记 `<终报>.entry.log`);`CODEX_TMUX_ENTRY_TIMEOUT`(默认 120s)内仍未进入 ⇒ state=failed、exit 2 大声失败——"窗格停在弹窗上但状态永远 running"的静默卡死已根治。`CODEX_TMUX_BYPASS=0` 走 codex 原生审批时弹窗正常出现且看门狗不代答——窗格本来就是交互的,人工作答或 `--timeout` 兜底。
 - **建议写进 `~/.codex/config.toml`**(用户机器级设置,非本 skill 分发内容;各人 config 含自有 provider/base_url,勿提交进任何仓库):
 
   ```toml
@@ -92,12 +92,13 @@ codex TUI 的交互弹窗会让无人值守窗格永久卡住,进度停滞。分
 ## 失败样态与排障
 
 - 窗格死亡未完成 → exit 2:现场保留在死窗格 + `<终报>.pane.log`;notify 原始 JSON 在 `<终报>.notify.json`。
+- 启动期未进入(阻塞弹窗自动确认 5 次仍未进入,或未知卡屏)→ exit 2:state=`entry-timeout`,现场 `<终报>.pane.log` + 被按掉的屏幕在 `<终报>.entry.log`。
 - `--timeout <秒>` 到点 → exit 124:codex 本体继续跑,稍后自查 `<终报>.done` / `.notify.json`。
 - 辅件全在终报同目录:`.brief` `.launch.sh` `.notify.sh` `.notify.json` `.done` `.pane.log` `.stamp`。
 
 ## 旋钮
 
-- 环境变量:`CODEX_TMUX_MODE=pane|window|exec`、`CODEX_TMUX_LAYOUT=main-vertical|none`、`CODEX_TMUX_PANE_WIDTH`(首切宽,默认 `70%`)、`CODEX_TMUX_MAIN_WIDTH`(主窗格宽,默认 `30%`)、`CODEX_TMUX_BYPASS=1|0`(默认 1)、`CODEX_TMUX_CLOSE_DONE=1`(全局默认完成即关窗格,免每次加 `--close`;续聊靠 session-id 反查不依赖窗格存活,关窗无损 resume)、`CODEX_HOME`(session 反查,默认 `~/.codex`)。
+- 环境变量:`CODEX_TMUX_MODE=pane|window|exec`、`CODEX_TMUX_LAYOUT=main-vertical|none`、`CODEX_TMUX_PANE_WIDTH`(首切宽,默认 `70%`)、`CODEX_TMUX_MAIN_WIDTH`(主窗格宽,默认 `30%`)、`CODEX_TMUX_BYPASS=1|0`(默认 1)、`CODEX_TMUX_CLOSE_DONE=1`(全局默认完成即关窗格,免每次加 `--close`;续聊靠 session-id 反查不依赖窗格存活,关窗无损 resume)、`CODEX_TMUX_ENTRY_TIMEOUT`(启动进入看门狗窗口秒数,默认 `120`)、`CODEX_HOME`(session 反查,默认 `~/.codex`)。
 - 单次:`-w`=独立 window;`--close`=完成即关窗格;`--timeout <秒>`。
 
 ## 用户 /codex <任务> 直呼时

@@ -662,6 +662,24 @@ if [ "$mode" = exec ]; then
 fi
 
 # ---------- TUI notify/launch scripts ----------
+# codex 0.140 实证(2026-07-23):目录信任检查只读 config.toml,内联 -c projects.*.trust_level 覆盖不被采纳,
+# 未入册目录会弹 "Do you trust the contents of this directory?" 把无人值守窗格卡死在启动期。
+# 根治=启动前把 workdir 信任条目幂等写入 config.toml(仅 bypass 姿态;mkdir 锁防并发重复表头;
+# 内联 -c 预信任仍保留作前向兼容)。
+ensure_trusted_workdir() {
+    [ "${CODEX_TMUX_BYPASS:-1}" = 1 ] || return 0
+    local cfg="${CODEX_HOME:-$HOME/.codex}/config.toml" key="$1" lock="$REG_DIR/config-trust.lock" i=0
+    key=${key//\\/\\\\}; key=${key//\"/\\\"}
+    mkdir -p -- "$(dirname "$cfg")" 2>/dev/null || return 0
+    until mkdir "$lock" 2>/dev/null; do i=$((i+1)); [ "$i" -ge 100 ] && return 0; sleep 0.1; done
+    if ! grep -qF "[projects.\"$key\"]" "$cfg" 2>/dev/null; then
+        printf '\n[projects."%s"]\ntrust_level = "trusted"\n' "$key" >> "$cfg" \
+            && echo "[codex-tmux] 已写入目录信任条目: $key -> $cfg"
+    fi
+    rmdir "$lock" 2>/dev/null || true
+}
+ensure_trusted_workdir "$workdir"
+
 notify_sh="$report.notify.sh" launch_sh="$report.launch.sh" gate="$report.gate"
 {
     printf '#!/usr/bin/env bash\nset -u\n'
@@ -756,6 +774,30 @@ on_detach_signal() {
 }
 trap on_detach_signal INT TERM HUP
 
+# ---------- 启动进入看门狗 ----------
+# 只盯 done/dead 的旧循环对"停在启动弹窗/卡屏"无感知(状态永远 running,静默卡死)。
+# 进入判定:TUI 活动样式,或本次启动后有记录本 workdir 的 rollout 落盘;
+# 未进入且屏上是已知阻塞样式 ⇒ 自动 Enter(≤5 次,现场留 entry.log);超窗未进入 ⇒ 大声失败 exit 2。
+entry_timeout=${CODEX_TMUX_ENTRY_TIMEOUT:-120}
+entry_deadline=$((SECONDS + entry_timeout)) entered=0 dismissed=0
+entry_check() {  # return 0=已确认任务进入执行
+    local ptail sess="${CODEX_HOME:-$HOME/.codex}/sessions"
+    ptail=$(tmux capture-pane -p -t "$pane_id" 2>/dev/null | grep -v '^[[:space:]]*$' | tail -25) || return 1
+    if printf '%s\n' "$ptail" | grep -q -e 'esc to interrupt' -e 'Working (' -e 'tokens used'; then return 0; fi
+    if find "$sess" -type f -name 'rollout-*.jsonl' -newer "$report.stamp" 2>/dev/null | head -20 \
+        | xargs -r grep -l -F -- "\"cwd\":\"$workdir\"" 2>/dev/null | grep -q .; then return 0; fi
+    if [ "${CODEX_TMUX_BYPASS:-1}" = 1 ] && [ "$dismissed" -lt 5 ] && printf '%s\n' "$ptail" | grep -q \
+        -e 'Do you trust the contents of this directory' \
+        -e 'Press enter to continue' \
+        -e 'Use session directory'; then
+        printf '=== %s auto-dismiss #%s ===\n%s\n' "$(date '+%F %T')" "$((dismissed+1))" "$ptail" >> "$report.entry.log" 2>/dev/null || true
+        tmux send-keys -t "$pane_id" Enter 2>/dev/null || true
+        dismissed=$((dismissed+1))
+        echo "[codex-tmux] 检测到启动阻塞弹窗,已自动确认(#$dismissed) pane=$pane_id"
+    fi
+    return 1
+}
+
 start=$SECONDS last_seen_state=running
 while [ ! -e "$report.done" ]; do
     st=$(read_state "$report")
@@ -776,6 +818,18 @@ while [ ! -e "$report.done" ]; do
         rmdir "$report.run" 2>/dev/null || true
         echo "codex-tmux: Codex pane 已死亡但未交付，现场见 $panelog" >&2
         exit 2
+    fi
+    if [ "$entered" = 0 ]; then
+        if entry_check; then
+            entered=1
+            echo "[codex-tmux] 已确认任务进入执行 pane=$pane_id"
+        elif [ "$SECONDS" -ge "$entry_deadline" ]; then
+            capture
+            write_state "$report" failed "entry-timeout=${entry_timeout}s pane=$pane_id"
+            rmdir "$report.run" 2>/dev/null || true
+            echo "codex-tmux: ${entry_timeout}s 内未确认任务进入执行(启动弹窗/卡屏?现场见 $panelog 与 $report.entry.log);已判失败" >&2
+            exit 2
+        fi
     fi
     if [ "$timeout" -gt 0 ] && [ $((SECONDS - start)) -ge "$timeout" ]; then
         capture
