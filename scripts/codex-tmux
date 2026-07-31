@@ -563,12 +563,38 @@ mkdir -p -- "$(dirname "$report")" || die "无法创建报告目录"
 [ -n "$title" ] || { title=$(basename "$report"); title="${title%%.*}"; }
 tsv_safe "$title" || die "任务标题不能包含 tab/newline"
 
+# ---------- locate the tmux pane we should split next to ----------
+# Claude Code IDE/某些包装器会把 TMUX 环境变量剥掉，但进程仍在 tmux pane 里。
+# 先用 tty 匹配 pane_tty，不行就沿进程树匹配 pane_pid。
+find_current_tmux_pane() {
+    [ -n "${TMUX:-}" ] && [ -n "${TMUX_PANE:-}" ] && { printf '%s' "$TMUX_PANE"; return 0; }
+    command -v tmux >/dev/null 2>&1 || return 1
+    local tty="" pane="" pid="" ppid=""
+    tty=$(tty 2>/dev/null) || tty=""
+    if [ -n "$tty" ]; then
+        pane=$(tmux list-panes -a -F '#{pane_tty} #{pane_id}' 2>/dev/null \
+            | awk -v t="$tty" '$1==t{print $2; exit}')
+        [ -n "$pane" ] && { printf '%s' "$pane"; return 0; }
+    fi
+    pid=$$
+    while [ -n "$pid" ] && [ "$pid" -gt 1 ]; do
+        pane=$(tmux list-panes -a -F '#{pane_pid} #{pane_id}' 2>/dev/null \
+            | awk -v p="$pid" '$1==p{print $2; exit}')
+        [ -n "$pane" ] && { printf '%s' "$pane"; return 0; }
+        ppid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ') || ppid=""
+        [ -n "$ppid" ] && [ "$ppid" != "$pid" ] || break
+        pid=$ppid
+    done
+    return 1
+}
+
 target=""
 if [ "$mode" != exec ]; then
-    if [ -n "${TMUX:-}" ]; then
-        target="${TMUX_PANE:-}"
-    elif command -v tmux >/dev/null 2>&1; then
-        target=$(tmux list-sessions -F '#{session_attached} #{session_name}' 2>/dev/null | awk '$1>=1{print $2":"; exit}')
+    if command -v tmux >/dev/null 2>&1; then
+        target=$(find_current_tmux_pane)
+        if [ -z "$target" ]; then
+            target=$(tmux list-sessions -F '#{session_attached} #{session_name}' 2>/dev/null | awk '$1>=1{print $2":"; exit}')
+        fi
         [ -n "$target" ] || mode=exec
     else
         mode=exec

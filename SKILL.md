@@ -20,6 +20,7 @@ codex-tmux -t <任务名> -o <终报路径> -C <工作目录> --brief <简报文
 
 - 路径全绝对;不传 `-m`。bypass 沙箱、工作目录预信任(不弹信任提示)、(降级时)`--skip-git-repo-check` 均已内置,不重复传。
 - 效果:tmux 分窗格跑真 codex TUI(镜像 agent-team 布局与同款比例:首个右切 70%——cx 侧占大头,后续取 cx 区中位窗格奇偶交替分割,>2 窗格时 main-vertical、主窗格收 30%;每窗格独立边框色,标题钉死 `cx:<任务名>`、完成变 ✅,codex 改不掉),进度可视、可直接在窗格里插手对话;首个 turn 完成走 codex 官方 notify 接口写 `-o` 终报(尾部附 session-id 与续聊命令)并退出唤醒,窗格保留可续聊。
+- 即使 Claude Code 运行环境被剥掉了 `TMUX` 环境变量,脚本也会通过 `tty` / 进程树反向定位当前 Claude 所在的 tmux pane,并在它旁边 split,避免窗格错放到其它 session 里看不见。
 - 不在 tmux 时自动降级为 `codex exec` 黑盒等价形态(`-o` 语义不变)。
 
 ## effort 纪律
@@ -31,7 +32,7 @@ codex-tmux -t <任务名> -o <终报路径> -C <工作目录> --brief <简报文
 ## 沙箱
 
 - 本机默认 bypass(脚本内置 `--dangerously-bypass-approvals-and-sandbox`):本容器 bwrap 起不来,`-s workspace-write` 会让 codex 空手拒工(实证);环境本身已隔离。
-- 他人环境不需要 YOLO 时:`CODEX_TMUX_BYPASS=0` 改走 codex 默认审批/沙箱——窗格本来就是交互的,审批弹窗直接在窗格里人工处理。
+- 他人环境不需要 bypass 时:`CODEX_TMUX_BYPASS=0` 改走 codex 默认审批/沙箱——窗格本来就是交互的,审批弹窗直接在窗格里人工处理。
 
 ## 简报与并行
 
