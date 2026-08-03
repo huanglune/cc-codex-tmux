@@ -73,6 +73,8 @@ codex-tmux -t <task-name> -o <report-path> -C <workdir> --brief <brief-file> \
 | `--timeout S` | Max wait seconds (0 = unlimited); exits 124 on timeout |
 | `-- ...` | Extra flags passed directly to `codex` (after `--`) |
 
+Even if `TMUX` is not set in the environment (e.g. Claude Code IDE integration), the script locates the current tmux pane via `tty` or the process tree and splits next to it, so the pane opens right beside Claude instead of in a hidden session.
+
 ### Resume a session
 
 ```bash
