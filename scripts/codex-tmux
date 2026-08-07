@@ -508,7 +508,7 @@ rebalance() {
     done
     [ -n "$main" ] || return 0
     tmux select-layout -t "$win" main-vertical 2>/dev/null || true
-    tmux resize-pane -t "$main" -x "${CODEX_TMUX_MAIN_WIDTH:-30%}" 2>/dev/null || true
+    tmux resize-pane -t "$main" -x "${CODEX_TMUX_MAIN_WIDTH:-60%}" 2>/dev/null || true
 }
 
 case "${1:-}" in
@@ -746,7 +746,7 @@ if [ "$mode" = pane ]; then
     if [ ${#cxp[@]} -eq 0 ]; then
         split_target="$target"
         [ -n "$split_target" ] || split_target="$win"
-        pane_id=$(tmux split-window -d -t "$split_target" -h -l "${CODEX_TMUX_PANE_WIDTH:-70%}" -P -F '#{pane_id}' -- "$panecmd" 2>/dev/null) || pane_id=""
+        pane_id=$(tmux split-window -d -t "$split_target" -h -l "${CODEX_TMUX_PANE_WIDTH:-40%}" -P -F '#{pane_id}' -- "$panecmd" 2>/dev/null) || pane_id=""
     else
         c=${#cxp[@]}; p="${cxp[$(( (c - 1) / 2 ))]}"; dir=-h; [ $((c % 2)) = 1 ] && dir=-v
         pane_id=$(tmux split-window -d -t "$p" "$dir" -P -F '#{pane_id}' -- "$panecmd" 2>/dev/null) || pane_id=""

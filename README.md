@@ -101,8 +101,8 @@ Panes are **kept after completion by default** (so you can resume in-pane) — t
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `CODEX_TMUX_MODE` | `pane` | `pane` / `window` / `exec` |
-| `CODEX_TMUX_PANE_WIDTH` | `70%` | Width of the first Codex pane split |
-| `CODEX_TMUX_MAIN_WIDTH` | `30%` | Main pane width when >2 panes trigger `main-vertical` |
+| `CODEX_TMUX_PANE_WIDTH` | `40%` | Width of the first Codex pane split |
+| `CODEX_TMUX_MAIN_WIDTH` | `60%` | Main pane width when >2 panes trigger `main-vertical` |
 | `CODEX_TMUX_LAYOUT` | `main-vertical` | `main-vertical` / `none` |
 | `CODEX_TMUX_BYPASS` | `1` | `1` = `--dangerously-bypass-approvals-and-sandbox`; `0` = default Codex approval flow |
 | `CODEX_TMUX_CLOSE_DONE` | `0` | `1` = auto-close the pane on completion (global default for `--close`); resume is unaffected |
