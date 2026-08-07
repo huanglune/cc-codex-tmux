@@ -19,7 +19,7 @@ codex-tmux -t <任务名> -o <终报路径> -C <工作目录> --brief <简报文
 ```
 
 - 路径全绝对;不传 `-m`。bypass 沙箱、工作目录预信任(不弹信任提示)、(降级时)`--skip-git-repo-check` 均已内置,不重复传。
-- 效果:tmux 分窗格跑真 codex TUI(镜像 agent-team 布局与同款比例:首个右切 70%——cx 侧占大头,后续取 cx 区中位窗格奇偶交替分割,>2 窗格时 main-vertical、主窗格收 30%;每窗格独立边框色,标题钉死 `cx:<任务名>`、完成变 ✅,codex 改不掉),进度可视、可直接在窗格里插手对话;首个 turn 完成走 codex 官方 notify 接口写 `-o` 终报(尾部附 session-id 与续聊命令)并退出唤醒,窗格保留可续聊。
+- 效果:tmux 分窗格跑真 codex TUI(首个右切 40%,cc 主窗格保留 60%;后续取 cx 区中位窗格奇偶交替分割,>2 窗格时 main-vertical 继续保持 cc 60% / cx 40%;每窗格独立边框色,标题钉死 `cx:<任务名>`、完成变 ✅,codex 改不掉),进度可视、可直接在窗格里插手对话;首个 turn 完成走 codex 官方 notify 接口写 `-o` 终报(尾部附 session-id 与续聊命令)并退出唤醒,窗格保留可续聊。
 - 即使 Claude Code 运行环境被剥掉了 `TMUX` 环境变量,脚本也会通过 `tty` / 进程树反向定位当前 Claude 所在的 tmux pane,并在它旁边 split,避免窗格错放到其它 session 里看不见。
 - 不在 tmux 时自动降级为 `codex exec` 黑盒等价形态(`-o` 语义不变)。
 
@@ -99,7 +99,7 @@ codex TUI 的交互弹窗会让无人值守窗格永久卡住,进度停滞。分
 
 ## 旋钮
 
-- 环境变量:`CODEX_TMUX_MODE=pane|window|exec`、`CODEX_TMUX_LAYOUT=main-vertical|none`、`CODEX_TMUX_PANE_WIDTH`(首切宽,默认 `70%`)、`CODEX_TMUX_MAIN_WIDTH`(主窗格宽,默认 `30%`)、`CODEX_TMUX_BYPASS=1|0`(默认 1)、`CODEX_TMUX_CLOSE_DONE=1`(全局默认完成即关窗格,免每次加 `--close`;续聊靠 session-id 反查不依赖窗格存活,关窗无损 resume)、`CODEX_TMUX_ENTRY_TIMEOUT`(启动进入看门狗窗口秒数,默认 `120`)、`CODEX_HOME`(session 反查,默认 `~/.codex`)。
+- 环境变量:`CODEX_TMUX_MODE=pane|window|exec`、`CODEX_TMUX_LAYOUT=main-vertical|none`、`CODEX_TMUX_PANE_WIDTH`(首切 cx 宽,默认 `40%`)、`CODEX_TMUX_MAIN_WIDTH`(cc 主窗格宽,默认 `60%`)、`CODEX_TMUX_BYPASS=1|0`(默认 1)、`CODEX_TMUX_CLOSE_DONE=1`(全局默认完成即关窗格,免每次加 `--close`;续聊靠 session-id 反查不依赖窗格存活,关窗无损 resume)、`CODEX_TMUX_ENTRY_TIMEOUT`(启动进入看门狗窗口秒数,默认 `120`)、`CODEX_HOME`(session 反查,默认 `~/.codex`)。
 - 单次:`-w`=独立 window;`--close`=完成即关窗格;`--timeout <秒>`。
 
 ## 用户 /codex <任务> 直呼时
