@@ -1,6 +1,6 @@
 ---
 name: codex
-description: 派发子任务给 codex CLI:tmux 窗格跑可视 TUI(agent-team 布局),notify 完成唤醒主会话,不在 tmux 自动降级 exec 黑盒。任何 codex 派发、resume 追问、并行批发,动手前先加载本 skill 拿调用细则;用户 /codex <任务> = 把该任务包成简报交 codex 执行。
+description: 派发子任务给 codex CLI:tmux 窗格跑可视 TUI(agent-team 布局),notify/完成兜底唤醒主会话,不在 tmux 或 Codex 0.153+ 无 notify 时自动降级 exec 黑盒。任何 codex 派发、resume 追问、并行批发、中途 queue 转向,动手前先加载本 skill 拿调用细则;用户 /codex <任务> = 把该任务包成简报交 codex 执行。
 argument-hint: <要交给 codex 的任务描述>
 ---
 
@@ -9,6 +9,12 @@ argument-hint: <要交给 codex 的任务描述>
 脚本:本 skill 目录内 `scripts/codex-tmux`,随目录分发、零安装。**下文所有 `codex-tmux` 均指 `bash <本 skill 目录绝对路径>/scripts/codex-tmux`**(加载本 skill 时目录已知,调用时自行展开为绝对路径;使用者若已将其 symlink 进 PATH,直呼亦可,非必需)。
 
 依赖:bash≥4.4、tmux≥3.2、codex CLI、GNU coreutils;jq/node/python3 任一用于提取终报(全缺时终报只留原始 JSON 指针,流程不受影响)。
+
+## 版本兼容性
+
+- 已针对 Codex CLI **0.152.0** 测试;0.153.0-alpha 起 `notify` 回调可能移除,脚本启动时会自动探测。
+- 若探测到 `notify` 不被支持,TUI(`pane`/`window`)模式会自动降级为 `exec` 模式,避免窗格永远等不到唤醒。
+- 中途转向优先使用 0.152+ 原生 `codex queue`,不再依赖 brittle 的 `tmux send-keys`。
 
 ## 标准调用(新任务)
 
@@ -22,6 +28,7 @@ codex-tmux -t <任务名> -o <终报路径> -C <工作目录> --brief <简报文
 - 效果:tmux 分窗格跑真 codex TUI(首个右切 40%,cc 主窗格保留 60%;后续取 cx 区中位窗格奇偶交替分割,>2 窗格时 main-vertical 继续保持 cc 60% / cx 40%;每窗格独立边框色,标题钉死 `cx:<任务名>`、完成变 ✅,codex 改不掉),进度可视、可直接在窗格里插手对话;首个 turn 完成走 codex 官方 notify 接口写 `-o` 终报(尾部附 session-id 与续聊命令)并退出唤醒,窗格保留可续聊。
 - 即使 Claude Code 运行环境被剥掉了 `TMUX` 环境变量,脚本也会通过 `tty` / 进程树反向定位当前 Claude 所在的 tmux pane,并在它旁边 split,避免窗格错放到其它 session 里看不见。
 - 不在 tmux 时自动降级为 `codex exec` 黑盒等价形态(`-o` 语义不变)。
+- **Codex 0.153+ 或 `notify` 配置被禁用时,TUI 模式会自动降级为 `exec` 模式**,终报契约不变,只是无可见窗格。
 
 ## effort 纪律
 
@@ -32,6 +39,7 @@ codex-tmux -t <任务名> -o <终报路径> -C <工作目录> --brief <简报文
 ## 沙箱
 
 - 本机默认 bypass(脚本内置 `--dangerously-bypass-approvals-and-sandbox`):本容器 bwrap 起不来,`-s workspace-write` 会让 codex 空手拒工(实证);环境本身已隔离。
+- 中间档:`CODEX_TMUX_BYPASS=auto` 使用 Codex 0.152+ 的 `--approve-for-me`,保留 `workspace-write` sandbox 但自动审批,适合希望有沙箱又不愿手动点的环境。
 - 他人环境不需要 bypass 时:`CODEX_TMUX_BYPASS=0` 改走 codex 默认审批/沙箱——窗格本来就是交互的,审批弹窗直接在窗格里人工处理。
 
 ## 简报与并行
@@ -51,7 +59,19 @@ codex-tmux --resume <session-id|last> -t <任务名> -o <新终报> --brief <追
 
 ## 中途转向(向在飞窗格发消息)
 
-在飞任务要插手(补指令、纠偏、改范围)时不重开会话,直接把消息打进窗格。**三段式,Enter 必须单独一步**:
+在飞任务要插手(补指令、纠偏、改范围)时不重开会话,优先用 Codex 0.152+ 原生 queue:
+
+```
+codex-tmux queue <任务名> --message "<消息文本>"
+# 或按 pane_id
+codex-tmux queue %19 --message "<消息文本>"
+```
+
+脚本会从登记簿查找对应 session-id 并执行 `codex queue --thread <id> --message "..."`,消息在下一个工具边界注入,无需跟 TUI 重绘赛跑。
+
+### legacy fallback: tmux 直打键盘
+
+只有 `codex queue` 不可用(旧版 CLI)或窗格里的会话已离线时才手动打键盘。**三段式,Enter 必须单独一步**:
 
 ```
 tmux set-buffer -b steer '<消息文本>'
@@ -77,7 +97,7 @@ tmux capture-pane -p -t <pane_id> | tail -8   # 验证到达,不许盲发即走
 
 codex TUI 的交互弹窗会让无人值守窗格永久卡住,进度停滞。分两道处理:
 
-- **脚本已内建(默认开,无需加参数)**:bypass 姿态带 `--dangerously-bypass-approvals-and-sandbox`(+探测支持时 `--dangerously-bypass-hook-trust`)关审批/hook 类弹窗;**目录信任对话框需单独处理——0.140 实证(2026-07-23):信任检查只读 config.toml,内联 `-c projects."…".trust_level` 覆盖无效**,cwd 不在册即弹 "Do you trust the contents of this directory?" 永久卡死(历史上没炸只因 cwd 恰好都在早已入册的目录下;首个 `~/md1/...` 新目录即中招)。故脚本启动前把 workdir 信任条目**幂等写入 `~/.codex/config.toml`**(仅 bypass 姿态;mkdir 锁防并发重复表头;内联 `-c` 保留作前向兼容)。**启动进入看门狗**:spawn 后每轮核验"任务已真正进入执行"(TUI 活动样式或本次启动后记录该 workdir 的 rollout 落盘),未进入且屏上是已知阻塞样式(目录信任/`Press enter to continue`/resume 目录选择器)则自动 Enter(≤5 次,现场追记 `<终报>.entry.log`);`CODEX_TMUX_ENTRY_TIMEOUT`(默认 120s)内仍未进入 ⇒ state=failed、exit 2 大声失败——"窗格停在弹窗上但状态永远 running"的静默卡死已根治。`CODEX_TMUX_BYPASS=0` 走 codex 原生审批时弹窗正常出现且看门狗不代答——窗格本来就是交互的,人工作答或 `--timeout` 兜底。
+- **脚本已内建(默认开,无需加参数)**:bypass 姿态带 `--dangerously-bypass-approvals-and-sandbox`(+探测支持时 `--dangerously-bypass-hook-trust`)关审批/hook 类弹窗;**目录信任对话框需单独处理——0.140 实证(2026-07-23):旧版信任检查只读 config.toml**。Codex 0.152+ 已支持内联 `-c projects."…".trust_level="trusted"` 覆盖,因此脚本默认**只通过 `-c` 传递信任**,不再写入你的 `~/.codex/config.toml`。若你在旧版 Codex 或特殊环境下需要持久化写入,设 `CODEX_TMUX_PERSIST_TRUST=1`。**启动进入看门狗**:spawn 后每轮核验"任务已真正进入执行"(TUI 活动样式或本次启动后记录该 workdir 的 rollout 落盘),未进入且屏上是已知阻塞样式(目录信任/`Press enter to continue`/resume 目录选择器)则自动 Enter(≤5 次,现场追记 `<终报>.entry.log`);`CODEX_TMUX_ENTRY_TIMEOUT`(默认 120s)内仍未进入 ⇒ state=failed、exit 2 大声失败——"窗格停在弹窗上但状态永远 running"的静默卡死已根治。`CODEX_TMUX_BYPASS=0` 走 codex 原生审批时弹窗正常出现且看门狗不代答——窗格本来就是交互的,人工作答或 `--timeout` 兜底。
 - **建议写进 `~/.codex/config.toml`**(用户机器级设置,非本 skill 分发内容;各人 config 含自有 provider/base_url,勿提交进任何仓库):
 
   ```toml
@@ -99,7 +119,7 @@ codex TUI 的交互弹窗会让无人值守窗格永久卡住,进度停滞。分
 
 ## 旋钮
 
-- 环境变量:`CODEX_TMUX_MODE=pane|window|exec`、`CODEX_TMUX_LAYOUT=main-vertical|none`、`CODEX_TMUX_PANE_WIDTH`(首切 cx 宽,默认 `40%`)、`CODEX_TMUX_MAIN_WIDTH`(cc 主窗格宽,默认 `60%`)、`CODEX_TMUX_BYPASS=1|0`(默认 1)、`CODEX_TMUX_CLOSE_DONE=1`(全局默认完成即关窗格,免每次加 `--close`;续聊靠 session-id 反查不依赖窗格存活,关窗无损 resume)、`CODEX_TMUX_ENTRY_TIMEOUT`(启动进入看门狗窗口秒数,默认 `120`)、`CODEX_HOME`(session 反查,默认 `~/.codex`)。
+- 环境变量:`CODEX_TMUX_MODE=pane|window|exec`、`CODEX_TMUX_LAYOUT=main-vertical|none`、`CODEX_TMUX_PANE_WIDTH`(首切 cx 宽,默认 `40%`)、`CODEX_TMUX_MAIN_WIDTH`(cc 主窗格宽,默认 `60%`)、`CODEX_TMUX_BYPASS=1|auto|0`(默认 1)、`CODEX_TMUX_CLOSE_DONE=1`(全局默认完成即关窗格,免每次加 `--close`;续聊靠 session-id 反查不依赖窗格存活,关窗无损 resume)、`CODEX_TMUX_ENTRY_TIMEOUT`(启动进入看门狗窗口秒数,默认 `120`)、`CODEX_TMUX_PERSIST_TRUST=1`(默认 0,让脚本把目录信任写入 `~/.codex/config.toml`)、`CODEX_HOME`(session 反查,默认 `~/.codex`)。
 - 单次:`-w`=独立 window;`--close`=完成即关窗格;`--timeout <秒>`。
 
 ## 用户 /codex <任务> 直呼时

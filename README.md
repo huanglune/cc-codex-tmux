@@ -19,10 +19,11 @@ Claude Code can delegate sub-tasks to Codex CLI. Without this skill, delegation 
 - **Non-blocking** — Runs via `run_in_background`; exits on first-turn completion to wake the caller.
 - **Parallel dispatch** — Spin up N independent tasks in one batch; each gets its own pane, title, and report path.
 - **Resume** — Continue a previous Codex session with `--resume <session-id|last>`.
+- **Mid-turn steering** — Queue messages to a running session with `codex-tmux queue` (uses Codex 0.152+ native `codex queue`).
 - **Pane management** — `list` / `kill <name|%id|done|all>` commands with a registry that auto-prunes dead panes.
 - **Prompt-proof for unattended runs** — Default bypass posture kills approval/trust dialogs at the root: launches with `--dangerously-bypass-approvals-and-sandbox` (plus `--dangerously-bypass-hook-trust` when the CLI supports it) and pre-trusts the working directory inline via `-c`, so panes don't hang on interactive dialogs.
-- **Graceful degradation** — No tmux? Falls back to `codex exec` (headless) with identical `-o` semantics.
-- **Notify integration** — Uses Codex's official notify callback to capture the final response and session ID.
+- **Graceful degradation** — No tmux? Codex 0.153+ removed `notify`? Falls back to `codex exec` (headless) with identical `-o` semantics.
+- **Notify integration** — Uses Codex's official notify callback when available; auto-detects unsupported versions and switches to exec-mode fallback.
 - **Zero install** — Pure bash script; no build step, no package manager.
 
 ## Requirements
@@ -31,7 +32,13 @@ Claude Code can delegate sub-tasks to Codex CLI. Without this skill, delegation 
 - tmux ≥ 3.2
 - [Codex CLI](https://github.com/openai/codex) (`codex` in PATH)
 - GNU coreutils
-- One of: jq / node / python3 (for extracting the final report from notify JSON; all absent = raw JSON pointer, flow unaffected)
+- One of: jq / node / python3 (for extracting the final report from notify/rollout JSON; all absent = raw JSON pointer, flow unaffected)
+
+## Compatibility
+
+- Tested on Codex CLI **0.152.0**.
+- Codex 0.153.0+ may remove the legacy `notify` config. `codex-tmux` probes for it on startup and automatically falls back to `codex exec` mode if it is unsupported, preserving the same report/evidence contract.
+- Mid-turn steering via `codex-tmux queue` requires Codex CLI 0.152.0+ (which introduces `codex queue`).
 
 ## Installation
 
@@ -84,6 +91,15 @@ codex-tmux --resume <session-id|last> -t <task-name> -o <new-report> \
 
 Session ID is printed at the bottom of each report. Omit `-C` to reuse the original session's working directory; the script recovers it from the session rollout and passes it to Codex explicitly, avoiding an unattended directory-selection prompt.
 
+### Mid-turn steering
+
+```bash
+codex-tmux queue <task-name> --message "Add unit tests for the edge cases"
+codex-tmux queue %42 --message "Stop and explain the current plan"
+```
+
+This uses the native `codex queue --thread <id> --message "..."` command introduced in Codex 0.152.0. It is more reliable than pasting keystrokes into a rapidly-redrawing TUI pane.
+
 ### Pane management
 
 ```bash
@@ -104,8 +120,9 @@ Panes are **kept after completion by default** (so you can resume in-pane) — t
 | `CODEX_TMUX_PANE_WIDTH` | `40%` | Width of the first Codex pane split |
 | `CODEX_TMUX_MAIN_WIDTH` | `60%` | Main pane width when >2 panes trigger `main-vertical` |
 | `CODEX_TMUX_LAYOUT` | `main-vertical` | `main-vertical` / `none` |
-| `CODEX_TMUX_BYPASS` | `1` | `1` = `--dangerously-bypass-approvals-and-sandbox`; `0` = default Codex approval flow |
+| `CODEX_TMUX_BYPASS` | `1` | `1` = full bypass; `auto` = `--approve-for-me`; `0` = native approval flow |
 | `CODEX_TMUX_CLOSE_DONE` | `0` | `1` = auto-close the pane on completion (global default for `--close`); resume is unaffected |
+| `CODEX_TMUX_PERSIST_TRUST` | `0` | `1` = write `[projects."…"].trust_level` into `~/.codex/config.toml`; `0` = inline `-c` only |
 | `CODEX_HOME` | `~/.codex` | Session lookup directory |
 
 ## Report Format
@@ -140,10 +157,12 @@ Claude Code main session
   ├── writes task brief to file
   ├── calls: codex-tmux -t foo -o report.md --brief brief.md -- ...
   │     │
-  │     ├── splits a tmux pane (agent-team layout)
+  │     ├── probes Codex CLI for legacy notify support
+  │     ├── splits a tmux pane (agent-team layout) when notify is supported
   │     ├── launches real Codex TUI with the brief as first prompt
   │     ├── configures notify callback → writes .notify.json + .done
   │     └── polls for .done, then extracts report and exits
+  │     (or falls back to codex exec if notify is unsupported)
   │
   └── (run_in_background) ← wakes up here, reads report.md
 ```
@@ -152,11 +171,17 @@ Claude Code main session
 
 By default, `CODEX_TMUX_BYPASS=1` passes `--dangerously-bypass-approvals-and-sandbox` to Codex. This is designed for isolated environments (containers, VMs) where bubblewrap can't run.
 
+For a middle ground, set `CODEX_TMUX_BYPASS=auto` to use Codex 0.152+'s `--approve-for-me` with the `workspace-write` sandbox: commands are still sandboxed but approvals are automatic.
+
 For shared or production machines, set `CODEX_TMUX_BYPASS=0` — Codex will use its normal approval flow, and you can interact with approval prompts directly in the tmux pane.
 
 ## Suppressing Interactive Prompts
 
-Codex TUI dialogs can stall an unattended pane. By default `codex-tmux` suppresses approval/trust dialogs at the root (bypass flags + inline pre-trust of the working directory — no flags needed; with `CODEX_TMUX_BYPASS=0` you answer prompts in the pane yourself). The remaining prompts are Codex-level nudges best silenced once in `~/.codex/config.toml` — this is your own machine-level config (keep your provider/`base_url` there private; never commit it):
+Codex TUI dialogs can stall an unattended pane. By default `codex-tmux` suppresses approval/trust dialogs at the root (bypass flags + inline pre-trust of the working directory via `-c`, no config mutation). With `CODEX_TMUX_BYPASS=0` you answer prompts in the pane yourself.
+
+If you are on an older Codex CLI where inline `-c projects."…".trust_level` is ignored, set `CODEX_TMUX_PERSIST_TRUST=1` to have the script write trust entries into `~/.codex/config.toml`.
+
+The remaining prompts are Codex-level nudges best silenced once in `~/.codex/config.toml` — this is your own machine-level config (keep your provider/`base_url` there private; never commit it):
 
 ```toml
 check_for_update_on_startup = false      # startup update-check prompt
