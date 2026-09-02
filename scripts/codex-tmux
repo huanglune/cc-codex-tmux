@@ -20,14 +20,16 @@ codex-tmux — 在 tmux pane/window 中运行可视 Codex TUI，并用 notify �
 用法:
   codex-tmux -t TITLE -o REPORT [-C DIR] [--brief FILE] [--timeout S] [--close] [--] [CODEX FLAGS]
   codex-tmux --resume <SESSION_ID|last> -t TITLE -o REPORT [--brief FILE] [--] [CODEX FLAGS]
+  codex-tmux queue <TITLE|%PANE> --message "TEXT"
   codex-tmux list
   codex-tmux kill <TITLE|%PANE|done|all>
 
 自动化默认值:
-  CODEX_TMUX_BYPASS=1       关闭审批/沙箱，并在 CLI 支持时关闭 hook-trust 提示
+  CODEX_TMUX_BYPASS=1       1=关闭审批/沙箱；auto=--approve-for-me；0=原生审批
   CODEX_TMUX_REQUIRE_REPORT=1
                              TUI 仅在 REPORT 非空后交付；缺失时标记“待输入”并继续等待
   CODEX_TMUX_MODE=pane      pane | window | exec
+  CODEX_TMUX_PERSIST_TRUST=0  1=写入 ~/.codex/config.toml；0=仅内联 -c 覆盖
 EOF
 }
 
@@ -51,6 +53,34 @@ atomic_touch() {
     local dest="$1" tmp="${1}.tmp.$$"
     (umask 077; : > "$tmp") || return 1
     mv -f -- "$tmp" "$dest"
+}
+
+# ---------- Codex CLI capability probes ----------
+# Cached in globals so we only probe once per invocation.
+_CODEX_VERSION="" _NOTIFY_SUPPORTED=""
+
+codex_version() {
+    [ -n "$_CODEX_VERSION" ] && { printf '%s' "$_CODEX_VERSION"; return 0; }
+    _CODEX_VERSION=$(codex --version 2>/dev/null | head -1 | sed -n 's/.*\([0-9]\+\.[0-9]\+\.[0-9]\+\).*/\1/p')
+    printf '%s' "$_CODEX_VERSION"
+}
+
+# Probe whether the legacy `notify` config key is still honored.
+# In Codex 0.152.0+ it is implemented as legacy_notify_argv and scheduled for removal.
+notify_supported() {
+    [ -n "$_NOTIFY_SUPPORTED" ] && { [ "$_NOTIFY_SUPPORTED" = 1 ]; return; }
+    local err
+    # We must actually invoke exec (not --help) because --help short-circuits config validation.
+    err=$(codex exec -c 'notify=["/bin/true"]' --skip-git-repo-check </dev/null 2>&1 >/dev/null)
+    if printf '%s' "$err" | grep -q 'unknown configuration field `notify`'; then
+        _NOTIFY_SUPPORTED=0; return 1
+    fi
+    _NOTIFY_SUPPORTED=1; return 0
+}
+
+version_ge() {
+    # Compare two x.y.z version strings. Returns 0 if $1 >= $2.
+    printf '%s\n%s\n' "$1" "$2" | sort -V -C 2>/dev/null
 }
 
 write_state() {
@@ -484,6 +514,41 @@ cmd_kill() {
     [ "$n" -gt 0 ]
 }
 
+cmd_queue() {
+    local sel="${1:-}" rows pid t rep wd ts color thread="" msg=""
+    [ -n "$sel" ] || { echo "用法: codex-tmux queue <任务名|%pane_id> --message \"TEXT\"" >&2; return 2; }
+    sel="${sel#cx:}"
+    shift
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --message) [ $# -ge 2 ] || die "--message 缺少值"; msg="$2"; shift 2 ;;
+            -m) [ $# -ge 2 ] || die "-m 缺少值"; msg="$2"; shift 2 ;;
+            *) die "queue 未知参数 $1" ;;
+        esac
+    done
+    [ -n "$msg" ] || { echo "codex-tmux queue: 必须提供 --message" >&2; return 2; }
+    tsv_safe "$msg" || die "消息不能包含 tab/newline"
+
+    rows=$(reg_snapshot) || return 1
+    [ -n "$rows" ] || { echo "(无登记的 codex pane)" >&2; return 1; }
+    while IFS=$'\t' read -r pid t rep wd ts color; do
+        [ -n "$pid" ] || continue
+        if [ "$sel" = "$pid" ] || [ "$sel" = "$t" ]; then
+            thread=""
+            [ -s "$rep.meta.json" ] && thread=$(json_scalar "$rep.meta.json" thread_id 2>/dev/null) || true
+            [ -z "$thread" ] && [ -s "$rep.notify.json" ] && thread=$(json_scalar "$rep.notify.json" thread-id 2>/dev/null) || true
+            if [ -z "$thread" ]; then
+                echo "codex-tmux: 找不到 $sel 的 session-id，无法 queue" >&2; return 1
+            fi
+            echo "[codex-tmux] queue -> $sel thread=$thread"
+            codex queue --thread "$thread" --message "$msg"
+            return $?
+        fi
+    done <<< "$rows"
+    echo "codex-tmux: 没有匹配 '$sel' 的 pane" >&2
+    return 1
+}
+
 registered_panes_in_window() {
     local win="$1" rows pid t rep wd ts color pwin
     rows=$(reg_snapshot) || return 1
@@ -515,6 +580,7 @@ case "${1:-}" in
     __notify) shift; internal_notify "$@"; exit $? ;;
     list|ls) shift; cmd_list "$@"; exit $? ;;
     kill|close|rm) shift; cmd_kill "$@"; exit $? ;;
+    queue|q) shift; cmd_queue "$@"; exit $? ;;
 esac
 
 # ---------- dispatch argument parsing ----------
@@ -543,7 +609,8 @@ extra=("$@")
 case "$mode" in pane|window|exec) ;; *) die "CODEX_TMUX_MODE 必须是 pane、window 或 exec" ;; esac
 [[ "$timeout" =~ ^[0-9]+$ ]] || die "--timeout 必须是非负整数秒"
 case "$require_report" in 0|1) ;; *) die "CODEX_TMUX_REQUIRE_REPORT 必须是 0 或 1" ;; esac
-case "${CODEX_TMUX_BYPASS:-1}" in 0|1) ;; *) die "CODEX_TMUX_BYPASS 必须是 0 或 1" ;; esac
+case "${CODEX_TMUX_BYPASS:-1}" in 0|1|auto|AUTO) ;; *) die "CODEX_TMUX_BYPASS 必须是 1、auto 或 0" ;; esac
+case "${CODEX_TMUX_PERSIST_TRUST:-0}" in 0|1) ;; *) die "CODEX_TMUX_PERSIST_TRUST 必须是 0 或 1" ;; esac
 tsv_safe "$title" || die "任务标题不能包含 tab/newline"
 tsv_safe "$report" || die "报告路径不能包含 tab/newline"
 tsv_safe "$workdir" || die "工作目录不能包含 tab/newline"
@@ -557,6 +624,12 @@ done
 
 command -v codex >/dev/null 2>&1 || die "未找到 codex CLI"
 choose_json_engine || die "需要 node、python3 或 jq 之一处理结构化结果"
+
+# Codex 0.152.0+ 把 notify 标记为 legacy，随时可能移除。提前探测并降级。
+if [ "$mode" != exec ] && ! notify_supported; then
+    echo "[codex-tmux] 警告: 当前 Codex CLI ($(codex_version)) 不再支持 notify 回调，TUI 模式将降级为 exec 模式" >&2
+    mode=exec
+fi
 
 report=$(realpath -m -- "$report")
 mkdir -p -- "$(dirname "$report")" || die "无法创建报告目录"
@@ -644,12 +717,19 @@ fi
 [ -s "$brief" ] || { rmdir "$report.run"; die "简报为空"; }
 
 bypassflag=()
-if [ "${CODEX_TMUX_BYPASS:-1}" = 1 ]; then
-    bypassflag=(--dangerously-bypass-approvals-and-sandbox)
-    if codex --help 2>&1 | grep -q -- '--dangerously-bypass-hook-trust'; then
-        bypassflag+=(--dangerously-bypass-hook-trust)
-    fi
-fi
+case "${CODEX_TMUX_BYPASS:-1}" in
+    1)
+        bypassflag=(--dangerously-bypass-approvals-and-sandbox)
+        if codex --help 2>&1 | grep -q -- '--dangerously-bypass-hook-trust'; then
+            bypassflag+=(--dangerously-bypass-hook-trust)
+        fi
+        ;;
+    auto|AUTO)
+        bypassflag=(--approve-for-me)
+        ;;
+    0) ;;
+    *) die "CODEX_TMUX_BYPASS 必须是 1、auto 或 0" ;;
+esac
 
 panelog="$report.pane.log" events="$report.events.jsonl" canonical="$report.notify.json"
 last_tmp="$report.last.codex.tmp.$$"
@@ -696,6 +776,8 @@ ensure_trusted_workdir() {
     [ "${CODEX_TMUX_BYPASS:-1}" = 1 ] || return 0
     local cfg="${CODEX_HOME:-$HOME/.codex}/config.toml" key="$1" lock="$REG_DIR/config-trust.lock" i=0
     key=${key//\\/\\\\}; key=${key//\"/\\\"}
+    # 0.152+ 支持内联 -c 覆盖，优先不碰用户 config.toml。
+    [ "${CODEX_TMUX_PERSIST_TRUST:-0}" = 1 ] || return 0
     mkdir -p -- "$(dirname "$cfg")" 2>/dev/null || return 0
     until mkdir "$lock" 2>/dev/null; do i=$((i+1)); [ "$i" -ge 100 ] && return 0; sleep 0.1; done
     if ! grep -qF "[projects.\"$key\"]" "$cfg" 2>/dev/null; then
@@ -725,7 +807,13 @@ Do not create the summary merely to ask a clarification question; ask in this pa
 codex_cmd=(codex)
 [ -n "$resume_id" ] && codex_cmd+=(resume)
 codex_cmd+=("${bypassflag[@]}" -C "$workdir" -c "projects.\"$toml_workdir\".trust_level=\"trusted\"")
-codex_cmd+=("${extra[@]}" -c "notify=[\"$toml_notify\"]" --)
+codex_cmd+=("${extra[@]}")
+# 0.152.0+ 中 notify 已是 legacy，探测不支持时就不传，避免窗格卡死。
+if notify_supported; then
+    codex_cmd+=(-c "notify=[\"$toml_notify\"]" --)
+else
+    codex_cmd+=(--)
+fi
 [ -n "$resume_id" ] && codex_cmd+=("$resume_id")
 codex_cmd+=("$bootstrap")
 {
