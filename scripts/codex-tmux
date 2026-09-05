@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# codex-tmux — 在 tmux pane/window 中运行可视 Codex TUI，并以官方 notify 回调交付结果。
+# codex-tmux — 在 tmux pane/window 中运行可视 Codex TUI，并以 Stop 生命周期 hook（或 legacy notify）交付结果。
 # 默认面向已有外部隔离边界的自动化环境：关闭 Codex 内层审批/沙箱与 hook trust。
 
 set -u
@@ -20,6 +20,7 @@ codex-tmux — 在 tmux pane/window 中运行可视 Codex TUI，并用 notify �
 用法:
   codex-tmux -t TITLE -o REPORT [-C DIR] [--brief FILE] [--timeout S] [--close] [--] [CODEX FLAGS]
   codex-tmux --resume <SESSION_ID|last> -t TITLE -o REPORT [--brief FILE] [--] [CODEX FLAGS]
+  codex-tmux --fork   <SESSION_ID|last> -t TITLE -o REPORT [--brief FILE] [--] [CODEX FLAGS]
   codex-tmux queue <TITLE|%PANE> --message "TEXT"
   codex-tmux list
   codex-tmux kill <TITLE|%PANE|done|all>
@@ -29,7 +30,10 @@ codex-tmux — 在 tmux pane/window 中运行可视 Codex TUI，并用 notify �
   CODEX_TMUX_REQUIRE_REPORT=1
                              TUI 仅在 REPORT 非空后交付；缺失时标记“待输入”并继续等待
   CODEX_TMUX_MODE=pane      pane | window | exec
-  CODEX_TMUX_PERSIST_TRUST=0  1=写入 ~/.codex/config.toml；0=仅内联 -c 覆盖
+  CODEX_TMUX_DELIVERY=auto  auto | hook | notify  交付通道：Stop hook（0.152+，stable）优先，legacy notify 兜底
+  CODEX_TMUX_STOP_NUDGES=2  终报缺失时由 Stop hook 自动催写的最大次数（0=关）
+  CODEX_TMUX_PERSIST_TRUST=1  1=启动前把 workdir 信任写入 ~/.codex/config.toml；0=仅内联 -c 覆盖
+                             （0.153.4 实测内联覆盖仍会弹目录信任框，靠看门狗代按；默认 1 免弹）
 EOF
 }
 
@@ -57,7 +61,7 @@ atomic_touch() {
 
 # ---------- Codex CLI capability probes ----------
 # Cached in globals so we only probe once per invocation.
-_CODEX_VERSION="" _NOTIFY_SUPPORTED=""
+_CODEX_VERSION="" _NOTIFY_SUPPORTED="" _HOOKS_SUPPORTED=""
 
 codex_version() {
     [ -n "$_CODEX_VERSION" ] && { printf '%s' "$_CODEX_VERSION"; return 0; }
@@ -76,6 +80,29 @@ notify_supported() {
         _NOTIFY_SUPPORTED=0; return 1
     fi
     _NOTIFY_SUPPORTED=1; return 0
+}
+
+# Probe whether lifecycle hooks (stable since 0.152) accept an inline `hooks.Stop` override.
+hooks_supported() {
+    [ -n "$_HOOKS_SUPPORTED" ] && { [ "$_HOOKS_SUPPORTED" = 1 ]; return; }
+    local err
+    codex exec --help 2>&1 | grep -q -- '--dangerously-bypass-hook-trust' || { _HOOKS_SUPPORTED=0; return 1; }
+    err=$(codex exec -c 'hooks.Stop=[]' --skip-git-repo-check </dev/null 2>&1 >/dev/null)
+    if printf '%s' "$err" | grep -q 'unknown configuration field `hooks`'; then
+        _HOOKS_SUPPORTED=0; return 1
+    fi
+    _HOOKS_SUPPORTED=1; return 0
+}
+
+# Pick the TUI delivery channel: hook (preferred) | notify (legacy) | "" (none -> degrade to exec).
+delivery_channel() {
+    case "${CODEX_TMUX_DELIVERY:-auto}" in
+        hook)   hooks_supported && printf hook ;;
+        notify) notify_supported && printf notify ;;
+        auto)   if hooks_supported; then printf hook; elif notify_supported; then printf notify; fi ;;
+        *) die "CODEX_TMUX_DELIVERY 必须是 auto、hook 或 notify" ;;
+    esac
+    return 0
 }
 
 version_ge() {
@@ -326,6 +353,25 @@ msg=open(last,errors="replace").read() if os.path.exists(last) else ""; print(js
     mv -f -- "$tmp" "$dest"
 }
 
+# Convert a Stop-hook payload (session_id/turn_id/cwd/last_assistant_message/transcript_path)
+# into the notify-shaped JSON the rest of the pipeline understands.
+json_hook_to_notify() { # $1=src $2=dest
+    local src="$1" dest="$2" tmp="${2}.tmp.$$"; choose_json_engine || return 1
+    case "$JSON_ENGINE" in
+        node)
+            node -e 'const fs=require("fs");const j=JSON.parse(fs.readFileSync(process.argv[1],"utf8"));process.stdout.write(JSON.stringify({type:"agent-turn-complete","thread-id":j.session_id??"","turn-id":j.turn_id??"",cwd:j.cwd??"",client:"codex-hook","input-messages":[],"last-assistant-message":j.last_assistant_message??"","transcript-path":j.transcript_path??"",model:j.model??"","stop-hook-active":!!j.stop_hook_active})+"\n")' "$src" > "$tmp"
+            ;;
+        python3)
+            python3 -c 'import json,sys; j=json.load(open(sys.argv[1])); print(json.dumps({"type":"agent-turn-complete","thread-id":j.get("session_id") or "","turn-id":j.get("turn_id") or "","cwd":j.get("cwd") or "","client":"codex-hook","input-messages":[],"last-assistant-message":j.get("last_assistant_message") or "","transcript-path":j.get("transcript_path") or "","model":j.get("model") or "","stop-hook-active":bool(j.get("stop_hook_active"))},ensure_ascii=False))' "$src" > "$tmp"
+            ;;
+        jq)
+            jq '{type:"agent-turn-complete","thread-id":(.session_id//""),"turn-id":(.turn_id//""),cwd:(.cwd//""),client:"codex-hook","input-messages":[],"last-assistant-message":(.last_assistant_message//""),"transcript-path":(.transcript_path//""),model:(.model//""),"stop-hook-active":(.stop_hook_active//false)}' "$src" > "$tmp"
+            ;;
+    esac || { rm -f -- "$tmp"; return 1; }
+    chmod 600 "$tmp" 2>/dev/null || true
+    mv -f -- "$tmp" "$dest"
+}
+
 append_footer() {
     local report="$1" json="$2" meta="$3" pane="$4" mode="$5" thread cwd
     grep -q '^\[codex-tmux\] session-id:' "$report" 2>/dev/null && return 0
@@ -363,9 +409,10 @@ finalize_payload() {
 
 # ---------- hidden notify entrypoint; payload comes from stdin, not a second argv ----------
 internal_notify() {
-    local report="" title="" mode="pane" workdir="" require_report=1 close_pane=0 pane="${TMUX_PANE:-}"
+    local report="" title="" mode="pane" workdir="" require_report=1 close_pane=0 pane="${TMUX_PANE:-}" payload=notify
     while [ $# -gt 0 ]; do
         case "$1" in
+            --payload) payload="${2-}"; shift 2 ;;
             --report) report="${2-}"; shift 2 ;;
             --title) title="${2-}"; shift 2 ;;
             --mode) mode="${2-}"; shift 2 ;;
@@ -386,6 +433,9 @@ internal_notify() {
         printf 'invalid notify JSON at %s\n' "$(date '+%F %T')" | atomic_write "$err"
         write_state "$report" failed "invalid-notify-json"
         return 2
+    fi
+    if [ "$payload" = hook ]; then
+        json_hook_to_notify "$latest" "$latest" || { write_state "$report" failed "hook-payload-convert"; return 2; }
     fi
     json_extract_last "$latest" "$latest_last" || true
 
@@ -584,7 +634,7 @@ case "${1:-}" in
 esac
 
 # ---------- dispatch argument parsing ----------
-title="" report="" workdir="$PWD" workdir_set=0 brief_src="" resume_id=""
+title="" report="" workdir="$PWD" workdir_set=0 brief_src="" resume_id="" resume_kind=resume
 mode="${CODEX_TMUX_MODE:-pane}" close_pane=0 timeout="${CODEX_TMUX_TIMEOUT:-0}"
 require_report="${CODEX_TMUX_REQUIRE_REPORT:-1}"
 while [ $# -gt 0 ]; do
@@ -593,7 +643,8 @@ while [ $# -gt 0 ]; do
         -o) [ $# -ge 2 ] || die "-o 缺少值"; report="$2"; shift 2 ;;
         -C) [ $# -ge 2 ] || die "-C 缺少值"; workdir="$2"; workdir_set=1; shift 2 ;;
         --brief) [ $# -ge 2 ] || die "--brief 缺少值"; brief_src="$2"; shift 2 ;;
-        --resume) [ $# -ge 2 ] || die "--resume 缺少值"; resume_id="$2"; shift 2 ;;
+        --resume) [ $# -ge 2 ] || die "--resume 缺少值"; resume_id="$2"; resume_kind=resume; shift 2 ;;
+        --fork) [ $# -ge 2 ] || die "--fork 缺少值"; resume_id="$2"; resume_kind=fork; shift 2 ;;
         -w|--window) mode=window; shift ;;
         --close) close_pane=1; shift ;;
         --timeout) [ $# -ge 2 ] || die "--timeout 缺少值"; timeout="$2"; shift 2 ;;
@@ -610,7 +661,8 @@ case "$mode" in pane|window|exec) ;; *) die "CODEX_TMUX_MODE 必须是 pane、wi
 [[ "$timeout" =~ ^[0-9]+$ ]] || die "--timeout 必须是非负整数秒"
 case "$require_report" in 0|1) ;; *) die "CODEX_TMUX_REQUIRE_REPORT 必须是 0 或 1" ;; esac
 case "${CODEX_TMUX_BYPASS:-1}" in 0|1|auto|AUTO) ;; *) die "CODEX_TMUX_BYPASS 必须是 1、auto 或 0" ;; esac
-case "${CODEX_TMUX_PERSIST_TRUST:-0}" in 0|1) ;; *) die "CODEX_TMUX_PERSIST_TRUST 必须是 0 或 1" ;; esac
+case "${CODEX_TMUX_PERSIST_TRUST:-1}" in 0|1) ;; *) die "CODEX_TMUX_PERSIST_TRUST 必须是 0 或 1" ;; esac
+[[ "${CODEX_TMUX_STOP_NUDGES:-2}" =~ ^[0-9]+$ ]] || die "CODEX_TMUX_STOP_NUDGES 必须是非负整数"
 tsv_safe "$title" || die "任务标题不能包含 tab/newline"
 tsv_safe "$report" || die "报告路径不能包含 tab/newline"
 tsv_safe "$workdir" || die "工作目录不能包含 tab/newline"
@@ -625,10 +677,14 @@ done
 command -v codex >/dev/null 2>&1 || die "未找到 codex CLI"
 choose_json_engine || die "需要 node、python3 或 jq 之一处理结构化结果"
 
-# Codex 0.152.0+ 把 notify 标记为 legacy，随时可能移除。提前探测并降级。
-if [ "$mode" != exec ] && ! notify_supported; then
-    echo "[codex-tmux] 警告: 当前 Codex CLI ($(codex_version)) 不再支持 notify 回调，TUI 模式将降级为 exec 模式" >&2
-    mode=exec
+# TUI 交付通道：Stop hook（0.152+ stable）优先，legacy notify 兜底；两者都没有才降级 exec。
+channel=""
+if [ "$mode" != exec ]; then
+    channel=$(delivery_channel)
+    if [ -z "$channel" ]; then
+        echo "[codex-tmux] 警告: 当前 Codex CLI ($(codex_version)) 既不支持 hooks 也不支持 notify 回调，TUI 模式将降级为 exec 模式" >&2
+        mode=exec
+    fi
 fi
 
 report=$(realpath -m -- "$report")
@@ -699,7 +755,7 @@ rmdir "$report.claim" 2>/dev/null || true
 rm -f -- "$report" "$evidence" "$report.done" "$report.notify.json" "$report.latest.notify.json" \
     "$report.last.md" "$report.latest.md" "$report.meta.json" "$report.state" "$report.notify.error" \
     "$report.pane.log" "$report.events.jsonl" "$report.launch.sh" "$report.notify.sh" "$report.stamp" \
-    "$report.gate"
+    "$report.gate" "$report.hook.sh" "$report.hook.log" "$report.nudge" "$report.question.md"
 [ "$brief_src" = "$report.brief" ] 2>/dev/null || rm -f -- "$report.brief"
 mkdir "$report.run" || die "无法建立 run lock: $report.run"
 chmod 700 "$report.run" 2>/dev/null || true
@@ -731,6 +787,10 @@ case "${CODEX_TMUX_BYPASS:-1}" in
     *) die "CODEX_TMUX_BYPASS 必须是 1、auto 或 0" ;;
 esac
 
+if [ "$channel" = hook ]; then
+    case " ${bypassflag[*]} " in *" --dangerously-bypass-hook-trust "*) ;; *) bypassflag+=(--dangerously-bypass-hook-trust) ;; esac
+fi
+
 panelog="$report.pane.log" events="$report.events.jsonl" canonical="$report.notify.json"
 last_tmp="$report.last.codex.tmp.$$"
 
@@ -738,7 +798,7 @@ last_tmp="$report.last.codex.tmp.$$"
 if [ "$mode" = exec ]; then
     write_state "$report" running "mode=exec"
     cmd=(codex exec)
-    [ -n "$resume_id" ] && cmd+=(resume)
+    [ -n "$resume_id" ] && cmd+=("$resume_kind")
     cmd+=("${bypassflag[@]}" --skip-git-repo-check)
     [ -z "$resume_id" ] && cmd+=(-C "$workdir")
     cmd+=("${extra[@]}" --json -o "$last_tmp")
@@ -776,8 +836,9 @@ ensure_trusted_workdir() {
     [ "${CODEX_TMUX_BYPASS:-1}" = 1 ] || return 0
     local cfg="${CODEX_HOME:-$HOME/.codex}/config.toml" key="$1" lock="$REG_DIR/config-trust.lock" i=0
     key=${key//\\/\\\\}; key=${key//\"/\\\"}
-    # 0.152+ 支持内联 -c 覆盖，优先不碰用户 config.toml。
-    [ "${CODEX_TMUX_PERSIST_TRUST:-0}" = 1 ] || return 0
+    # 0.153.4 实测(2026-09-05)：内联 -c projects.*.trust_level 仍不被信任检查采纳，未入册目录照样弹框；
+    # 默认持久化写入，内联 -c 保留作前向兼容。设 CODEX_TMUX_PERSIST_TRUST=0 可关闭写入。
+    [ "${CODEX_TMUX_PERSIST_TRUST:-1}" = 1 ] || return 0
     mkdir -p -- "$(dirname "$cfg")" 2>/dev/null || return 0
     until mkdir "$lock" 2>/dev/null; do i=$((i+1)); [ "$i" -ge 100 ] && return 0; sleep 0.1; done
     if ! grep -qF "[projects.\"$key\"]" "$cfg" 2>/dev/null; then
@@ -788,32 +849,54 @@ ensure_trusted_workdir() {
 }
 ensure_trusted_workdir "$workdir"
 
-notify_sh="$report.notify.sh" launch_sh="$report.launch.sh" gate="$report.gate"
-{
-    printf '#!/usr/bin/env bash\nset -u\n'
-    printf 'export CODEX_TMUX_CACHE_DIR=%q\n' "$REG_DIR"
-    printf 'printf %%s "${1:-}" | exec bash %q __notify --report %q --title %q --mode %q --workdir %q --require-report %q --close %q\n' \
-        "$SELF" "$report" "$title" "$mode" "$workdir" "$require_report" "$close_pane"
-} > "$notify_sh"
-chmod 700 "$notify_sh"
+notify_sh="$report.notify.sh" hook_sh="$report.hook.sh" launch_sh="$report.launch.sh" gate="$report.gate"
+json_str() { local v="$1"; v=${v//\\/\\\\}; v=${v//\"/\\\"}; v=${v//$'\n'/ }; printf '"%s"' "$v"; }
+write_callback_scripts() { # regenerated after launch too, because mode may flip pane->window
+    {
+        printf '#!/usr/bin/env bash\nset -u\n'
+        printf 'export CODEX_TMUX_CACHE_DIR=%q\n' "$REG_DIR"
+        printf 'printf %%s "${1:-}" | exec bash %q __notify --report %q --title %q --mode %q --workdir %q --require-report %q --close %q\n' \
+            "$SELF" "$report" "$title" "$mode" "$workdir" "$require_report" "$close_pane"
+    } > "$notify_sh"
+    chmod 700 "$notify_sh"
+    # Stop hook: payload on stdin, JSON on stdout. Delivers via __notify; when the report is still missing
+    # (early stop / preflight-only turn) it answers {"decision":"block"} up to CODEX_TMUX_STOP_NUDGES times,
+    # which makes Codex continue with the reason as a fresh prompt. A question file suppresses the nudge.
+    local reason
+    reason="终报 $report 尚未落盘。若任务已完成，现在按简报的交付要求写终报与证据文件 $evidence；若未完成，继续推进到完成再写；若确需用户答复才能继续，把问题写进 $report.question.md 后停止。"
+    {
+        printf '#!/usr/bin/env bash\nset -u\n'
+        printf 'export CODEX_TMUX_CACHE_DIR=%q\n' "$REG_DIR"
+        printf 'cat | bash %q __notify --payload hook --report %q --title %q --mode %q --workdir %q --require-report %q --close %q >/dev/null 2>>%q\n' \
+            "$SELF" "$report" "$title" "$mode" "$workdir" "$require_report" "$close_pane" "$report.hook.log"
+        printf 'state=""; [ -s %q ] && IFS=$'"'"'\\t'"'"' read -r state _ < %q\n' "$report.state" "$report.state"
+        printf 'n=0; [ -s %q ] && read -r n < %q\n' "$report.nudge" "$report.nudge"
+        printf 'if [ "$state" = needs-input ] && [ ! -s %q ] && [ "$n" -lt %q ]; then\n' "$report.question.md" "${CODEX_TMUX_STOP_NUDGES:-2}"
+        printf '  echo $((n+1)) > %q\n' "$report.nudge"
+        printf '  printf %%s\\\\n %q\n' "{\"decision\":\"block\",\"reason\":$(json_str "$reason")}"
+        printf 'else\n  printf "{}\\n"\nfi\n'
+    } > "$hook_sh"
+    chmod 700 "$hook_sh"
+}
+write_callback_scripts
 
 toml_workdir=${workdir//\\/\\\\}; toml_workdir=${toml_workdir//\"/\\\"}
 toml_notify=${notify_sh//\\/\\\\}; toml_notify=${toml_notify//\"/\\\"}
+toml_hook=${hook_sh//\\/\\\\}; toml_hook=${toml_hook//\"/\\\"}
 bootstrap="Read the complete task brief at: $brief
 Execute it as the user's full instructions. Progress is visible in this pane. Only when the task is actually complete, write the final summary to: $report
 Write detailed evidence to: $evidence
 Do not create the summary merely to ask a clarification question; ask in this pane and wait instead."
 
 codex_cmd=(codex)
-[ -n "$resume_id" ] && codex_cmd+=(resume)
+[ -n "$resume_id" ] && codex_cmd+=("$resume_kind")
 codex_cmd+=("${bypassflag[@]}" -C "$workdir" -c "projects.\"$toml_workdir\".trust_level=\"trusted\"")
 codex_cmd+=("${extra[@]}")
-# 0.152.0+ 中 notify 已是 legacy，探测不支持时就不传，避免窗格卡死。
-if notify_supported; then
-    codex_cmd+=(-c "notify=[\"$toml_notify\"]" --)
-else
-    codex_cmd+=(--)
-fi
+case "$channel" in
+    hook)   codex_cmd+=(-c "hooks.Stop=[{hooks=[{type=\"command\",command=\"$toml_hook\",timeout=60}]}]" --) ;;
+    notify) codex_cmd+=(-c "notify=[\"$toml_notify\"]" --) ;;
+    *)      codex_cmd+=(--) ;;
+esac
 [ -n "$resume_id" ] && codex_cmd+=("$resume_id")
 codex_cmd+=("$bootstrap")
 {
@@ -852,13 +935,7 @@ if [ -z "$pane_id" ]; then
 fi
 
 # split 失败转 window 后，回调必须记录最终 mode；gate 尚未打开，覆盖是安全的。
-{
-    printf '#!/usr/bin/env bash\nset -u\n'
-    printf 'export CODEX_TMUX_CACHE_DIR=%q\n' "$REG_DIR"
-    printf 'printf %%s "${1:-}" | exec bash %q __notify --report %q --title %q --mode %q --workdir %q --require-report %q --close %q\n' \
-        "$SELF" "$report" "$title" "$mode" "$workdir" "$require_report" "$close_pane"
-} > "$notify_sh"
-chmod 700 "$notify_sh"
+write_callback_scripts
 
 rows=$(reg_snapshot) || rows=""; ncx=0; [ -n "$rows" ] && ncx=$(printf '%s\n' "$rows" | grep -c .)
 color=${CX_COLORS[$(( ncx % ${#CX_COLORS[@]} ))]}
