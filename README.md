@@ -18,12 +18,13 @@ Claude Code can delegate sub-tasks to Codex CLI. Without this skill, delegation 
 - **Visual tmux panes** — Real Codex TUI in a split pane; agent-team-style layout with colored borders and pinned titles (`cx:<task>`, turning `✅` on completion).
 - **Non-blocking** — Runs via `run_in_background`; exits on first-turn completion to wake the caller.
 - **Parallel dispatch** — Spin up N independent tasks in one batch; each gets its own pane, title, and report path.
-- **Resume** — Continue a previous Codex session with `--resume <session-id|last>`.
+- **Resume / Fork** — Continue a previous Codex session with `--resume <session-id|last>`, or branch off its context into a new thread with `--fork <session-id|last>` (no active-writer conflict with a still-open pane).
 - **Mid-turn steering** — Queue messages to a running session with `codex-tmux queue` (uses Codex 0.152+ native `codex queue`).
 - **Pane management** — `list` / `kill <name|%id|done|all>` commands with a registry that auto-prunes dead panes.
 - **Prompt-proof for unattended runs** — Default bypass posture kills approval/trust dialogs at the root: launches with `--dangerously-bypass-approvals-and-sandbox` (plus `--dangerously-bypass-hook-trust` when the CLI supports it) and pre-trusts the working directory inline via `-c`, so panes don't hang on interactive dialogs.
-- **Graceful degradation** — No tmux? Codex 0.153+ removed `notify`? Falls back to `codex exec` (headless) with identical `-o` semantics.
-- **Notify integration** — Uses Codex's official notify callback when available; auto-detects unsupported versions and switches to exec-mode fallback.
+- **Stop-hook delivery** — Uses Codex's stable lifecycle hooks (`hooks.Stop`, injected inline) to deliver the report the moment a turn ends; falls back to the legacy `notify` callback when hooks are unavailable.
+- **Early-stop nudge** — If a turn ends without the report on disk, the Stop hook answers `{"decision":"block"}` with a written instruction, so Codex keeps going instead of silently stopping after a preflight-only turn (max `CODEX_TMUX_STOP_NUDGES`, default 2; a `<report>.question.md` from Codex suppresses it).
+- **Graceful degradation** — No tmux? Neither hooks nor `notify` available? Falls back to `codex exec` (headless) with identical `-o` semantics.
 - **Zero install** — Pure bash script; no build step, no package manager.
 
 ## Requirements
@@ -36,8 +37,9 @@ Claude Code can delegate sub-tasks to Codex CLI. Without this skill, delegation 
 
 ## Compatibility
 
-- Tested on Codex CLI **0.152.0**.
-- Codex 0.153.0+ may remove the legacy `notify` config. `codex-tmux` probes for it on startup and automatically falls back to `codex exec` mode if it is unsupported, preserving the same report/evidence contract.
+- Tested on Codex CLI **0.152.0** and **0.153.4**.
+- Delivery channel is probed at startup: `hooks.Stop` (stable since 0.152) first, legacy `notify` second, `codex exec` fallback last. Override with `CODEX_TMUX_DELIVERY=hook|notify`.
+- On 0.153.4 the inline `-c projects."…".trust_level` override is still ignored by the trust check, so `CODEX_TMUX_PERSIST_TRUST` defaults to `1` (write the trust entry into `~/.codex/config.toml` before launch).
 - Mid-turn steering via `codex-tmux queue` requires Codex CLI 0.152.0+ (which introduces `codex queue`).
 
 ## Installation
@@ -75,6 +77,7 @@ codex-tmux -t <task-name> -o <report-path> -C <workdir> --brief <brief-file> \
 | `-C DIR` | Codex working directory (default: `$PWD`) |
 | `--brief FILE` | Task brief file; omit to read from stdin |
 | `--resume ID` | Resume a previous session (`ID` or `last`) |
+| `--fork ID` | Fork a previous session (`ID` or `last`) into a new thread that inherits its context |
 | `-w` | Use a separate tmux window instead of a split pane |
 | `--close` | Close the pane on completion (default: keep for follow-up; set `CODEX_TMUX_CLOSE_DONE=1` to make this the global default) |
 | `--timeout S` | Max wait seconds (0 = unlimited); exits 124 on timeout |
@@ -122,7 +125,9 @@ Panes are **kept after completion by default** (so you can resume in-pane) — t
 | `CODEX_TMUX_LAYOUT` | `main-vertical` | `main-vertical` / `none` |
 | `CODEX_TMUX_BYPASS` | `1` | `1` = full bypass; `auto` = `--approve-for-me`; `0` = native approval flow |
 | `CODEX_TMUX_CLOSE_DONE` | `0` | `1` = auto-close the pane on completion (global default for `--close`); resume is unaffected |
-| `CODEX_TMUX_PERSIST_TRUST` | `0` | `1` = write `[projects."…"].trust_level` into `~/.codex/config.toml`; `0` = inline `-c` only |
+| `CODEX_TMUX_PERSIST_TRUST` | `1` | `1` = write `[projects."…"].trust_level` into `~/.codex/config.toml` before launch; `0` = inline `-c` only (still prompts on 0.153.4) |
+| `CODEX_TMUX_DELIVERY` | `auto` | `auto` / `hook` / `notify` — report delivery channel |
+| `CODEX_TMUX_STOP_NUDGES` | `2` | Max times the Stop hook asks Codex to continue when the report is missing; `0` disables |
 | `CODEX_HOME` | `~/.codex` | Session lookup directory |
 
 ## Report Format
@@ -139,7 +144,7 @@ The report file (`-o`) contains:
    [codex-tmux] 续聊: codex-tmux --resume <id> -t <name> -o <report> --brief <file>
    ```
 
-Auxiliary files in the same directory: `.brief`, `.launch.sh`, `.notify.sh`, `.notify.json`, `.done`, `.pane.log`, `.stamp`.
+Auxiliary files in the same directory: `.brief`, `.launch.sh`, `.hook.sh`, `.hook.log`, `.notify.sh`, `.notify.json`, `.nudge`, `.question.md`, `.done`, `.pane.log`, `.stamp`.
 
 ## Exit Codes
 
@@ -157,12 +162,12 @@ Claude Code main session
   ├── writes task brief to file
   ├── calls: codex-tmux -t foo -o report.md --brief brief.md -- ...
   │     │
-  │     ├── probes Codex CLI for legacy notify support
-  │     ├── splits a tmux pane (agent-team layout) when notify is supported
+  │     ├── probes Codex CLI for hooks / legacy notify support
+  │     ├── splits a tmux pane (agent-team layout) when a delivery channel exists
   │     ├── launches real Codex TUI with the brief as first prompt
-  │     ├── configures notify callback → writes .notify.json + .done
+  │     ├── injects a Stop hook (or notify callback) → writes .notify.json + .done, nudges on missing report
   │     └── polls for .done, then extracts report and exits
-  │     (or falls back to codex exec if notify is unsupported)
+  │     (or falls back to codex exec if neither channel is supported)
   │
   └── (run_in_background) ← wakes up here, reads report.md
 ```
@@ -177,9 +182,9 @@ For shared or production machines, set `CODEX_TMUX_BYPASS=0` — Codex will use 
 
 ## Suppressing Interactive Prompts
 
-Codex TUI dialogs can stall an unattended pane. By default `codex-tmux` suppresses approval/trust dialogs at the root (bypass flags + inline pre-trust of the working directory via `-c`, no config mutation). With `CODEX_TMUX_BYPASS=0` you answer prompts in the pane yourself.
+Codex TUI dialogs can stall an unattended pane. By default `codex-tmux` suppresses approval/trust dialogs at the root: bypass flags, plus an idempotent trust entry for the working directory written into `~/.codex/config.toml` before launch (`CODEX_TMUX_PERSIST_TRUST=1`, the default, because the inline `-c projects."…".trust_level` override is still ignored on 0.153.4). With `CODEX_TMUX_BYPASS=0` you answer prompts in the pane yourself.
 
-If you are on an older Codex CLI where inline `-c projects."…".trust_level` is ignored, set `CODEX_TMUX_PERSIST_TRUST=1` to have the script write trust entries into `~/.codex/config.toml`.
+Set `CODEX_TMUX_PERSIST_TRUST=0` to leave your config untouched; the startup watchdog will then press through the trust dialog, at the cost of a few seconds.
 
 The remaining prompts are Codex-level nudges best silenced once in `~/.codex/config.toml` — this is your own machine-level config (keep your provider/`base_url` there private; never commit it):
 
