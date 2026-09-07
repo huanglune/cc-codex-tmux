@@ -34,7 +34,7 @@ codex-tmux -t <任务名> -o <终报路径> -C <工作目录> --brief <简报文
 
 - **每次调用(含 resume)必须显式传 `-c 'model_reasoning_effort="..."'`**,不依赖 config 默认——config 声称值与实际可长期背离(2026-07-12 实证事故:config 实为 medium 而文档称 max,历史任务全低档跑)。
 - 默认 `"max"`;**简单机械任务(模板化改写、批量重命名、格式整理、照清单执行)显式降 `"medium"`/`"high"`**——不是思考越多越好,高 effort 更慢;判断类(设计、审查、debug、性能、并发)一律 max。
-- 产出存疑时核实实际档位:`grep -m1 '"reasoning_effort"' ~/.codex/sessions/<日期>/rollout-*<session-id>*.jsonl`。模型走 `~/.codex/config.toml` 默认(`gpt-5.6-sol`)。
+- 产出存疑时核实实际档位:`grep -m1 '"reasoning_effort"' ~/.codex/sessions/<日期>/rollout-*<session-id>*.jsonl`。模型走 `~/.codex/config.toml` 里的 `model`(脚本不传 `-m`;要临时换型号,把 `-m <slug>` 放 `--` 之后透传)。实际跑的型号看 rollout 里的 `"model"` 字段。
 
 ## 沙箱
 
